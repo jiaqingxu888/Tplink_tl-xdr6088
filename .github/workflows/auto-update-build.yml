@@ -131,21 +131,30 @@ jobs:
             exit 1
           fi
           cp "$DEFCONFIG_FILE" .config
+          echo "==== step1: first defconfig to fully expand ===="
+          make defconfig
+          echo "==== step2: force single device xdr6088 ===="
           sed -i 's/^CONFIG_TARGET_MULTI_PROFILE=y/# CONFIG_TARGET_MULTI_PROFILE is not set/' .config
           sed -i 's/^CONFIG_TARGET_PER_DEVICE_ROOTFS=y/# CONFIG_TARGET_PER_DEVICE_ROOTFS is not set/' .config
-          sed -i -E "/^CONFIG_TARGET_DEVICE_/ { /${CFG_DEVICE}/!d; }" .config
-          if ! grep -q "CONFIG_TARGET_DEVICE_${CFG_TARGET}_${CFG_SUBTARGET}_DEVICE_${CFG_DEVICE}=y" .config; then
-            echo "CONFIG_TARGET_DEVICE_${CFG_TARGET}_${CFG_SUBTARGET}_DEVICE_${CFG_DEVICE}=y" >> .config
+          sed -i -E 's/^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_(.*)=y/# CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_\1 is not set/' .config
+          sed -i 's/^# CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_tplink_tl-xdr6088 is not set/CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_tplink_tl-xdr6088=y/' .config
+          if ! grep -q "^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_tplink_tl-xdr6088=y" .config; then
+            echo "CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_tplink_tl-xdr6088=y" >> .config
           fi
-          make defconfig
-          echo "==== selected devices ===="
-          grep -E "CONFIG_TARGET_.*_DEVICE_" .config | grep -v PACKAGES || true
+          echo "==== step3: olddefconfig to apply ===="
+          make olddefconfig
+          echo "==== verify: selected devices ===="
+          grep "^CONFIG_TARGET_DEVICE_.*=y" .config || true
+          echo "==== verify: MULTI_PROFILE ===="
+          grep "CONFIG_TARGET_MULTI_PROFILE" .config || echo "not set, good"
 
       - name: Download sources
         if: steps.check.outputs.has_update == 'true'
         working-directory: openwrt
+        env:
+          WGET_TIMEOUT: 30
         run: |
-          make download -j8 V=s || make download -j1 V=s
+          make download -j2 V=s || make download -j1 V=s || make download -j1 V=s
 
       - name: Build firmware
         if: steps.check.outputs.has_update == 'true'
@@ -163,7 +172,7 @@ jobs:
           cd firmware
           for f in *; do
             case "$f" in
-              *"${CFG_DEVICE}"*|*xdr6088*) ;;
+              *xdr6088*) ;;
               *) rm -f "$f" ;;
             esac
           done
