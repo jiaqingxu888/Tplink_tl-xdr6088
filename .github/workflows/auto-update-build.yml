@@ -34,7 +34,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 240
+    timeout-minutes: 360
     steps:
       - name: Checkout this repo
         uses: actions/checkout@v4
@@ -121,11 +121,22 @@ jobs:
         if: "env.SHOULD_BUILD == 'true'"
         working-directory: openwrt
         run: |
+          if [ ! -f "../$DEFCFG_FILE" ]; then
+            echo "FATAL defconfig not found in your repo: $DEFCFG_FILE"
+            exit 1
+          fi
           cp "../$DEFCFG_FILE" .config
           make defconfig
           echo "---- locked device(s) ----"
-          grep -E 'CONFIG_TARGET_DEVICE_' .config | grep '=y' || true
+          grep -E 'CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_' .config | grep '=y' || true
           echo "--------------------------"
+          grep -q 'CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_tplink_tl-xdr6088=y' .config || { echo "FATAL xdr6088 not locked"; exit 1; }
+          OTHER=$(grep -E 'CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_' .config | grep '=y' | grep -v 'tplink_tl-xdr6088' || true)
+          if [ -n "$OTHER" ]; then
+            echo "WARN extra devices still enabled (will be filtered at collect):"
+            echo "$OTHER"
+          fi
+          echo "OK device locked = tplink_tl-xdr6088"
 
       - name: Download sources
         if: "env.SHOULD_BUILD == 'true'"
@@ -142,13 +153,13 @@ jobs:
         working-directory: openwrt
         run: |
           mkdir -p "$GITHUB_WORKSPACE/release"
-          find bin/targets -type f \( -name '*-sysupgrade.bin' -o -name '*-factory.bin' \) -exec cp -v {} "$GITHUB_WORKSPACE/release/" \;
+          find bin/targets -type f \( -name '*xdr6088*-sysupgrade.bin' -o -name '*xdr6088*-factory.bin' \) -exec cp -v {} "$GITHUB_WORKSPACE/release/" \;
           echo "==== collected files ===="
           ls -lh "$GITHUB_WORKSPACE/release/" || true
           N=$(find "$GITHUB_WORKSPACE/release/" -type f \( -name '*-sysupgrade.bin' -o -name '*-factory.bin' \) | wc -l)
           echo "firmware count = $N"
           if [ "$N" -lt 1 ]; then
-            echo "FATAL no firmware produced"
+            echo "FATAL no xdr6088 firmware produced"
             exit 1
           fi
 
@@ -172,6 +183,7 @@ jobs:
           echo "- 固件大小 $SIZE" >> "$OUT"
           echo "- 默认管理 IP $DEFAULT_IP" >> "$OUT"
           echo "- 编译时间 $BUILD_DATE (Asia/Shanghai)" >> "$OUT"
+          echo "- 内核 BPF/XDP 已启用 (dae 就绪)" >> "$OUT"
           echo "" >> "$OUT"
           echo "## 内置软件包" >> "$OUT"
           echo "$PKGS" | tr ',' '\n' | sed 's/^/- /' >> "$OUT"
