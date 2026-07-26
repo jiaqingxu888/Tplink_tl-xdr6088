@@ -20,8 +20,6 @@ env:
   DEFCONFIG_FILE: defconfig/mt7986-ax6000_dae.config
   CFG_TARGET: mediatek
   CFG_SUBTARGET: filogic
-  CFG_DEVICE: tplink_tl-xdr6088
-  MAIN_DEVICE: tplink_tl-xdr6088
   TZ: Asia/Shanghai
 
 jobs:
@@ -130,70 +128,71 @@ jobs:
             ls -la defconfig/ || true
             exit 1
           fi
+          echo "==== raw defconfig CONFIG_TARGET lines ===="
+          grep -E "CONFIG_TARGET" "$DEFCONFIG_FILE" || echo "(none)"
           cp "$DEFCONFIG_FILE" .config
           make defconfig
+
+          echo "==== after make defconfig: selected devices ===="
+          grep "^CONFIG_TARGET_.*_DEVICE_.*=y" .config || true
+
+          DEVICE_LINE=$(grep "^CONFIG_TARGET_${CFG_TARGET}_${CFG_SUBTARGET}_DEVICE_.*=y" .config | head -1)
+          if [ -z "$DEVICE_LINE" ]; then
+            echo "FATAL: no device selected under ${CFG_TARGET}/${CFG_SUBTARGET}."
+            grep "CONFIG_TARGET_.*_DEVICE_" .config || echo "(none at all)"
+            exit 1
+          fi
+          DEVICE_NAME=$(echo "$DEVICE_LINE" | sed -E "s/^CONFIG_TARGET_${CFG_TARGET}_${CFG_SUBTARGET}_DEVICE_(.*)=y$/\1/")
+          [ -z "$DEVICE_NAME" ] && { echo "FATAL: parse device name failed: $DEVICE_LINE"; exit 1; }
+          echo "TARGET_DEVICE=$DEVICE_NAME" >> "$GITHUB_ENV"
+          echo "==== TARGET_DEVICE = $DEVICE_NAME ===="
+
           sed -i 's/^CONFIG_TARGET_MULTI_PROFILE=y/# CONFIG_TARGET_MULTI_PROFILE is not set/' .config
           sed -i 's/^CONFIG_TARGET_PER_DEVICE_ROOTFS=y/# CONFIG_TARGET_PER_DEVICE_ROOTFS is not set/' .config
-          sed -i -E 's/^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_(.*)=y/# CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_\1 is not set/' .config
-          sed -i 's/^# CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_tplink_tl-xdr6088 is not set/CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_tplink_tl-xdr6088=y/' .config
-          grep -q "^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_tplink_tl-xdr6088=y" .config || \
-            echo "CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_tplink_tl-xdr6088=y" >> .config
           make defconfig
-          echo "==== selected devices ===="
-          grep "^CONFIG_TARGET_DEVICE_.*=y" .config || true
+
+          echo "==== FINAL selected devices (must be exactly 1) ===="
+          FINAL=$(grep "^CONFIG_TARGET_.*_DEVICE_.*=y" .config)
+          echo "$FINAL"
+          N=$(echo "$FINAL" | grep -c .)
+          [ "$N" != "1" ] && { echo "FATAL: expected 1 device, got $N"; exit 1; }
+          echo "$FINAL" | grep -q "$DEVICE_NAME" || { echo "FATAL: final device != $DEVICE_NAME"; exit 1; }
+          echo "OK: single device $DEVICE_NAME confirmed."
 
       - name: Patch mirrors and download sources
         if: steps.check.outputs.has_update == 'true'
         timeout-minutes: 30
         working-directory: openwrt
         run: |
-          # ===== 1. 清理缓存中的脏文件 =====
           find dl -type f -size 0 -delete 2>/dev/null || true
           find dl -name "*.aria2" -delete 2>/dev/null || true
           find dl -name "*.tmp" -delete 2>/dev/null || true
 
-          # ===== 2. 全仓库搜索并删除不稳定镜像 =====
-          # 不猜文件位置，grep找到就删
           echo "==== removing bad mirrors ===="
-          grep -rl "mirror\.iscas\.ac\.cn" . --include="*.pl" --include="*.mk" --include="*.sh" --include="Makefile" --include="rules.mk" 2>/dev/null | while read -r f; do
+          grep -rl "mirror\.iscas\.ac\.cn" . --include="*.pl" --include="*.mk" --include="*.sh" --include="Makefile" 2>/dev/null | while read -r f; do
             echo "  patching: $f"
             sed -i '/mirror\.iscas\.ac\.cn/d' "$f"
           done
-          # 验证
-          REMAINING=$(grep -r "mirror\.iscas\.ac\.cn" . 2>/dev/null | grep -v ".git/" | wc -l)
-          echo "  iscas references remaining: $REMAINING"
+          echo "  iscas remaining: $(grep -r 'mirror\.iscas\.ac\.cn' . 2>/dev/null | grep -v '.git/' | wc -l)"
 
-          # ===== 3. 全仓库缩短curl超时 =====
           echo "==== reducing curl timeouts ===="
           grep -rl "\-\-connect-timeout" . --include="*.pl" --include="*.mk" --include="*.sh" 2>/dev/null | while read -r f; do
-            echo "  patching timeout in: $f"
             sed -i 's/--connect-timeout [0-9]\+/--connect-timeout 10/g' "$f"
             sed -i 's/--retry [0-9]\+/--retry 2/g' "$f"
           done
 
-          # ===== 4. 下载：3次并发 + 1次串行兜底 =====
           ok=0
           for i in 1 2 3; do
             echo "==== download attempt $i (-j24) ===="
-            if timeout --kill-after=30 600 make download -j24 V=s 2>&1 | tail -50; then
-              ok=1
-              break
-            fi
-            echo "attempt $i failed, cleaning partial files..."
+            if timeout --kill-after=30 600 make download -j24 V=s 2>&1 | tail -50; then ok=1; break; fi
             find dl -type f -size 0 -delete 2>/dev/null || true
             sleep 5
           done
           if [ "$ok" != "1" ]; then
             echo "==== serial fallback (-j1) ===="
-            if timeout --kill-after=30 600 make download -j1 V=s 2>&1 | tail -100; then
-              ok=1
-            fi
+            timeout --kill-after=30 600 make download -j1 V=s 2>&1 | tail -100 && ok=1
           fi
-          if [ "$ok" != "1" ]; then
-            echo "ERROR: download failed after all retries"
-            echo "Files in dl/: $(ls -1 dl 2>/dev/null | wc -l)"
-            exit 1
-          fi
+          [ "$ok" != "1" ] && { echo "ERROR: download failed"; exit 1; }
           echo "==== download complete: $(ls -1 dl | wc -l) files, $(du -sh dl | cut -f1) ===="
 
       - name: Build firmware
@@ -203,45 +202,85 @@ jobs:
         run: |
           make -j$(nproc) V=s 2>&1 | tail -200 || make -j1 V=s 2>&1 | tail -200
 
-      - name: Collect firmware images
+      # ============ 收集：整棵 bin 目录，不过滤不删除 ============
+      - name: Collect all build outputs
         if: steps.check.outputs.has_update == 'true'
         id: fw
         run: |
-          mkdir -p firmware
-          find openwrt/bin/targets -type f \( -name "*.bin" -o -name "*.img" -o -name "*.ubi" -o -name "*.itb" -o -name "*.trx" -o -name "*.tar.gz" \) -exec cp -v {} firmware/ \; 2>/dev/null || true
-          cd firmware
-          # 只保留目标设备的文件
-          count=0
-          for f in *; do
-            [ "$f" = "*" ] && break
-            case "$f" in
-              *xdr6088*|*XDR6088*) count=$((count+1)) ;;
-              *) rm -f "$f" ;;
-            esac
-          done
-          echo "count=$count" >> "$GITHUB_OUTPUT"
-          [ "$count" -gt 0 ] && sha256sum * > SHA256SUMS 2>/dev/null || true
-          ls -lh
+          DEVICE="${TARGET_DEVICE}"
+          echo "==== device: $DEVICE ===="
 
-      - name: Upload artifact
-        if: steps.check.outputs.has_update == 'true' && steps.fw.outputs.count != '0'
+          # 1) 看看 bin 里到底有啥
+          echo "==== openwrt/bin tree (top 2 levels) ===="
+          find openwrt/bin -maxdepth 2 | sort || true
+          echo "==== total size of openwrt/bin ===="
+          du -sh openwrt/bin || true
+
+          # 2) 整棵 bin 原样搬进 release/，保留目录结构（跟你本地 bin 一模一样）
+          rm -rf release
+          mkdir -p release
+          cp -a openwrt/bin/. release/
+
+          # 3) 统计固件 bin 数量（targets 下的 .bin/.img/.ubi/.itb/.trx）
+          FW_COUNT=$(find release/targets -type f \( -name "*.bin" -o -name "*.img" -o -name "*.ubi" -o -name "*.itb" -o -name "*.trx" \) 2>/dev/null | wc -l)
+          echo "==== firmware image files in targets: $FW_COUNT ===="
+          find release/targets -type f \( -name "*.bin" -o -name "*.img" -o -name "*.ubi" -o -name "*.itb" -o -name "*.trx" \) 2>/dev/null | sort
+
+          # 4) 统计 ipk 数量
+          IPK_COUNT=$(find release -type f -name "*.ipk" 2>/dev/null | wc -l)
+          echo "==== ipk packages: $IPK_COUNT ===="
+
+          # 5) 打整包 tar.gz（含固件+ipk+manifest+buildinfo+profiles.json+sha256sums 全部）
+          PACK_NAME="immortalwrt-${DEVICE}-${{ env.BUILD_DATE }}-all.tar.gz"
+          tar -czf "$PACK_NAME" -C release .
+          echo "==== packed: $PACK_NAME ($(du -h "$PACK_NAME" | cut -f1)) ===="
+
+          # 6) 把固件 bin 单独拷一份到顶层，方便 release 页面不解压直接下
+          mkdir -p release_fw
+          find release/targets -type f \( -name "*.bin" -o -name "*.img" -o -name "*.ubi" -o -name "*.itb" -o -name "*.trx" \) -exec cp -v {} release_fw/ \; 2>/dev/null || true
+          # 固件对应的 manifest / sha256sums 也带上
+          find release/targets -maxdepth 3 -type f \( -name "*.manifest" -o -name "sha256sums" -o -name "*.buildinfo" -o -name "profiles.json" \) -exec cp -v {} release_fw/ \; 2>/dev/null || true
+
+          # 7) 校验：固件必须 >=1，整包必须非空，否则当场红
+          [ "$FW_COUNT" -lt 1 ] && { echo "FATAL: no firmware image built. Build likely failed or wrong device."; exit 1; }
+          [ ! -s "$PACK_NAME" ] && { echo "FATAL: tar.gz is empty"; exit 1; }
+
+          echo "fw_count=$FW_COUNT" >> "$GITHUB_OUTPUT"
+          echo "ipk_count=$IPK_COUNT" >> "$GITHUB_OUTPUT"
+          echo "pack_name=$PACK_NAME" >> "$GITHUB_OUTPUT"
+          echo "==== collect done ===="
+          ls -lh "$PACK_NAME"
+          ls -lh release_fw/
+
+      # ============ artifact：整棵 bin（解压即本地结构） ============
+      - name: Upload full bin as artifact
+        if: steps.check.outputs.has_update == 'true' && steps.fw.outputs.fw_count != '0'
         uses: actions/upload-artifact@v4
         with:
-          name: firmware-${{ env.MAIN_DEVICE }}-${{ env.BUILD_DATE }}
-          path: firmware/
-          retention-days: 30
+          name: bin-${{ env.TARGET_DEVICE }}-${{ env.BUILD_DATE }}
+          path: release/
+          retention-days: 7
 
+      # ============ Release：整包 tar.gz + 固件单独列出 ============
       - name: Create GitHub Release
-        if: steps.check.outputs.has_update == 'true' && steps.fw.outputs.count != '0'
+        if: steps.check.outputs.has_update == 'true' && steps.fw.outputs.fw_count != '0'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ env.BUILD_DATE }}-${{ steps.probe.outputs.upstream_short }}
-          name: "Firmware ${{ env.MAIN_DEVICE }} @ ${{ env.BUILD_DATE }}"
+          name: "Firmware ${{ env.TARGET_DEVICE }} @ ${{ env.BUILD_DATE }}"
           body: |
             Auto build from upstream.
             - Upstream commit: ${{ steps.probe.outputs.upstream_sha }}
-            - Device: ${{ env.CFG_DEVICE }}
+            - Device: ${{ env.TARGET_DEVICE }}
             - Defconfig: ${{ env.DEFCONFIG_FILE }}
             - Build time: ${{ env.BUILD_DATE }}
-          files: firmware/*
+            - Firmware images: ${{ steps.fw.outputs.fw_count }}
+            - IPK packages: ${{ steps.fw.outputs.ipk_count }}
+
+            **下载说明**
+            - `*-all.tar.gz`：完整产物包（固件 + 全部 ipk + manifest + buildinfo + profiles.json + sha256sums，解压后结构同本地 `bin/`）
+            - 其余 `.bin`：固件单独列出，可直接下载刷机
+          files: |
+            ${{ steps.fw.outputs.pack_name }}
+            release_fw/*
           prerelease: false
