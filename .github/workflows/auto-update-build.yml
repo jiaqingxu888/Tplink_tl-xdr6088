@@ -47,6 +47,7 @@ jobs:
           echo "upstream_sha=$UP_SHA" >> "$GITHUB_OUTPUT"
           echo "upstream_short=${UP_SHA:0:8}" >> "$GITHUB_OUTPUT"
 
+      # restore 放前面：读出"上次成功发布"记下的 sha
       - name: Restore last-built sha cache
         id: cache-sha
         uses: actions/cache@v4
@@ -55,6 +56,7 @@ jobs:
           key: last-built-sha-${{ github.run_id }}
           restore-keys: last-built-sha-
 
+      # Decide 只判断，绝不写 .last_sha
       - name: Decide whether to build
         id: check
         run: |
@@ -70,18 +72,10 @@ jobs:
             HAS_UPDATE=true
           fi
           echo "has_update=$HAS_UPDATE" >> "$GITHUB_OUTPUT"
-          echo "$UP" > .last_sha
 
       - name: Skip if no update
         if: steps.check.outputs.has_update != 'true'
         run: echo "No new upstream commit, skip."
-
-      - name: Save last-built sha cache
-        if: always()
-        uses: actions/cache@v4
-        with:
-          path: .last_sha
-          key: last-built-sha-${{ github.run_id }}
 
       - name: Clone full upstream source
         if: steps.check.outputs.has_update == 'true'
@@ -202,47 +196,37 @@ jobs:
         run: |
           make -j$(nproc) V=s 2>&1 | tail -200 || make -j1 V=s 2>&1 | tail -200
 
-      # ============ 收集：整棵 bin 目录，不过滤不删除 ============
       - name: Collect all build outputs
         if: steps.check.outputs.has_update == 'true'
         id: fw
         run: |
           DEVICE="${TARGET_DEVICE}"
           echo "==== device: $DEVICE ===="
-
-          # 1) 看看 bin 里到底有啥
           echo "==== openwrt/bin tree (top 2 levels) ===="
           find openwrt/bin -maxdepth 2 | sort || true
           echo "==== total size of openwrt/bin ===="
           du -sh openwrt/bin || true
 
-          # 2) 整棵 bin 原样搬进 release/，保留目录结构（跟你本地 bin 一模一样）
           rm -rf release
           mkdir -p release
           cp -a openwrt/bin/. release/
 
-          # 3) 统计固件 bin 数量（targets 下的 .bin/.img/.ubi/.itb/.trx）
           FW_COUNT=$(find release/targets -type f \( -name "*.bin" -o -name "*.img" -o -name "*.ubi" -o -name "*.itb" -o -name "*.trx" \) 2>/dev/null | wc -l)
           echo "==== firmware image files in targets: $FW_COUNT ===="
           find release/targets -type f \( -name "*.bin" -o -name "*.img" -o -name "*.ubi" -o -name "*.itb" -o -name "*.trx" \) 2>/dev/null | sort
 
-          # 4) 统计 ipk 数量
           IPK_COUNT=$(find release -type f -name "*.ipk" 2>/dev/null | wc -l)
           echo "==== ipk packages: $IPK_COUNT ===="
 
-          # 5) 打整包 tar.gz（含固件+ipk+manifest+buildinfo+profiles.json+sha256sums 全部）
           PACK_NAME="immortalwrt-${DEVICE}-${{ env.BUILD_DATE }}-all.tar.gz"
           tar -czf "$PACK_NAME" -C release .
           echo "==== packed: $PACK_NAME ($(du -h "$PACK_NAME" | cut -f1)) ===="
 
-          # 6) 把固件 bin 单独拷一份到顶层，方便 release 页面不解压直接下
           mkdir -p release_fw
           find release/targets -type f \( -name "*.bin" -o -name "*.img" -o -name "*.ubi" -o -name "*.itb" -o -name "*.trx" \) -exec cp -v {} release_fw/ \; 2>/dev/null || true
-          # 固件对应的 manifest / sha256sums 也带上
           find release/targets -maxdepth 3 -type f \( -name "*.manifest" -o -name "sha256sums" -o -name "*.buildinfo" -o -name "profiles.json" \) -exec cp -v {} release_fw/ \; 2>/dev/null || true
 
-          # 7) 校验：固件必须 >=1，整包必须非空，否则当场红
-          [ "$FW_COUNT" -lt 1 ] && { echo "FATAL: no firmware image built. Build likely failed or wrong device."; exit 1; }
+          [ "$FW_COUNT" -lt 1 ] && { echo "FATAL: no firmware image built."; exit 1; }
           [ ! -s "$PACK_NAME" ] && { echo "FATAL: tar.gz is empty"; exit 1; }
 
           echo "fw_count=$FW_COUNT" >> "$GITHUB_OUTPUT"
@@ -252,7 +236,6 @@ jobs:
           ls -lh "$PACK_NAME"
           ls -lh release_fw/
 
-      # ============ artifact：整棵 bin（解压即本地结构） ============
       - name: Upload full bin as artifact
         if: steps.check.outputs.has_update == 'true' && steps.fw.outputs.fw_count != '0'
         uses: actions/upload-artifact@v4
@@ -261,9 +244,9 @@ jobs:
           path: release/
           retention-days: 7
 
-      # ============ Release：整包 tar.gz + 固件单独列出 ============
       - name: Create GitHub Release
         if: steps.check.outputs.has_update == 'true' && steps.fw.outputs.fw_count != '0'
+        id: release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ env.BUILD_DATE }}-${{ steps.probe.outputs.upstream_short }}
@@ -284,3 +267,17 @@ jobs:
             ${{ steps.fw.outputs.pack_name }}
             release_fw/*
           prerelease: false
+
+      # 只有 release 真成功，才记下 sha —— 编砸不前进，下次自动重试
+      - name: Record built sha (only after successful release)
+        if: steps.check.outputs.has_update == 'true' && steps.release.outcome == 'success'
+        id: record
+        run: echo "${{ steps.probe.outputs.upstream_sha }}" > .last_sha
+
+      # save 挪到末尾，且仅 record 成功才存
+      - name: Save last-built sha cache
+        if: steps.record.outcome == 'success'
+        uses: actions/cache@v4
+        with:
+          path: .last_sha
+          key: last-built-sha-${{ github.run_id }}
