@@ -2,13 +2,21 @@ name: Auto Update & Build Firmware
 
 on:
   schedule:
-    - cron: '0 4,10,16,22 * * *'
+    - cron: '0 4,10,16,22 * * *'   # 04/10/16/22 点各查一次
+  push:
+    # 改配置或改本工作流，推上来就自动重判（指纹变了就会编）
+    paths:
+      - 'defconfig/**'
+      - '.github/workflows/**'
   workflow_dispatch:
     inputs:
       force_build:
-        description: 'force build even if no update'
+        description: 'force build even if release already has matching firmware'
         type: boolean
         default: false
+
+permissions:
+  contents: write   # 创建 release 必需
 
 concurrency:
   group: auto-update-build
@@ -17,267 +25,186 @@ concurrency:
 env:
   UPSTREAM_REPO: https://github.com/padavanonly/immortalwrt-mt798x-6.6.git
   UPSTREAM_BRANCH: openwrt-24.10-6.6
-  DEFCONFIG_FILE: defconfig/mt7986-ax6000_dae.config
+  DEFCFG_FILE: defconfig/mt7986-ax6000_dae.config
   CFG_TARGET: mediatek
   CFG_SUBTARGET: filogic
+  DEVICE_NAME: tplink_tl-xdr6088
+  DEFAULT_IP: 192.168.1.1          # 固件默认管理IP，如改过请改这里
   TZ: Asia/Shanghai
 
 jobs:
-  check-and-build:
+  build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 180
+    timeout-minutes: 240
     steps:
+      - name: Checkout this repo (for defconfig & workflow)
+        uses: actions/checkout@v4
 
-      - name: Set timezone
+      - name: Set timezone & build date
         run: |
           sudo timedatectl set-timezone "$TZ"
           echo "BUILD_DATE=$(date +%Y%m%d-%H%M)" >> "$GITHUB_ENV"
 
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
-          sudo docker image prune -a -f || true
+          sudo swapoff -a && sudo rm -f /swapfile
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
           df -h
 
-      - name: Shallow fetch upstream HEAD
-        id: probe
+      - name: Probe upstream + compute fingerprint + check release
+        id: decide
+        env:
+          FORCE: ${{ github.event.inputs.force_build }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git clone --depth 1 --branch "$UPSTREAM_BRANCH" "$UPSTREAM_REPO" /tmp/probe
-          UP_SHA=$(git -C /tmp/probe rev-parse HEAD)
-          echo "upstream_sha=$UP_SHA" >> "$GITHUB_OUTPUT"
-          echo "upstream_short=${UP_SHA:0:8}" >> "$GITHUB_OUTPUT"
+          set -e
+          # 1) 上游当前 HEAD（不 clone，快）
+          UP_SHA=$(git ls-remote "$UPSTREAM_REPO" "refs/heads/${UPSTREAM_BRANCH}" | awk '{print $1}')
+          if [ -z "$UP_SHA" ]; then echo "FATAL: cannot resolve upstream HEAD"; exit 1; fi
 
-      # restore 放前面：读出"上次成功发布"记下的 sha
-      - name: Restore last-built sha cache
-        id: cache-sha
-        uses: actions/cache@v4
-        with:
-          path: .last_sha
-          key: last-built-sha-${{ github.run_id }}
-          restore-keys: last-built-sha-
+          # 2) 编译指纹 = 上游sha + 配置内容 + 关键env
+          FP=$( {
+            echo "$UP_SHA"
+            cat "$DEFCFG_FILE"
+            echo "$CFG_TARGET|$CFG_SUBTARGET|$DEVICE_NAME|$DEFAULT_IP|$UPSTREAM_BRANCH"
+          } | sha256sum | cut -c1-12 )
 
-      # Decide 只判断，绝不写 .last_sha
-      - name: Decide whether to build
-        id: check
-        run: |
-          UP="${{ steps.probe.outputs.upstream_sha }}"
-          LAST=""
-          [ -f .last_sha ] && LAST=$(cat .last_sha)
-          echo "upstream=$UP last_built=$LAST"
-          if [ "${{ github.event.inputs.force_build }}" = "true" ]; then
-            HAS_UPDATE=true
-          elif [ "$UP" = "$LAST" ]; then
-            HAS_UPDATE=false
-          else
-            HAS_UPDATE=true
+          # 3) 查最新 release 的 tag，提取其中的 12 位指纹；查不到/提取不到 => 空
+          HTTP=$(curl -sS -o /tmp/rel.json -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest" || true)
+          LAST_FP=""
+          if [ "$HTTP" = "200" ]; then
+            TAG=$(jq -r '.tag_name // empty' /tmp/rel.json)
+            LAST_FP=$(echo "$TAG" | grep -oE '[0-9a-f]{12}' | head -1 || true)
           fi
-          echo "has_update=$HAS_UPDATE" >> "$GITHUB_OUTPUT"
 
-      - name: Skip if no update
-        if: steps.check.outputs.has_update != 'true'
-        run: echo "No new upstream commit, skip."
+          # 4) 多条件判定
+          REASON=""
+          if [ "$FORCE" = "true" ]; then
+            SB=true; REASON="force_build=true"
+          elif [ -z "$LAST_FP" ]; then
+            SB=true; REASON="no matching release found (release empty or tag has no fingerprint)"
+          elif [ "$LAST_FP" != "$FP" ]; then
+            SB=true; REASON="fingerprint changed (upstream/config/env changed)"
+          else
+            SB=false; REASON="release already has firmware for current fingerprint"
+          fi
 
-      - name: Clone full upstream source
-        if: steps.check.outputs.has_update == 'true'
+          echo "================ DECIDE ================"
+          echo "upstream HEAD   : $UP_SHA"
+          echo "current FP      : $FP"
+          echo "latest release  : ${TAG:-(none)}  -> fingerprint in tag: ${LAST_FP:-(none)}"
+          echo "SHOULD_BUILD    : $SB   ($REASON)"
+          echo "========================================"
+
+          echo "SHOULD_BUILD=$SB" >> "$GITHUB_ENV"
+          echo "FP=$FP"         >> "$GITHUB_ENV"
+          echo "UP_SHA=$UP_SHA"  >> "$GITHUB_ENV"
+
+      # ============ 以下全部仅在 SHOULD_BUILD=true 时执行 ============
+
+      - name: Clone upstream source
+        if: env.SHOULD_BUILD == 'true'
         run: |
-          git clone --branch "$UPSTREAM_BRANCH" "$UPSTREAM_REPO" openwrt
+          git clone --depth 1 -b "$UPSTREAM_BRANCH" "$UPSTREAM_REPO" openwrt
           cd openwrt
-          echo "SRC_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "cloned HEAD = $(git rev-parse HEAD)  (expect $UP_SHA)"
 
       - name: Install build dependencies
-        if: steps.check.outputs.has_update == 'true'
+        if: env.SHOULD_BUILD == 'true'
         run: |
-          sudo -E apt-get -qq update
-          sudo -E apt-get -qq install -y build-essential clang flex bison g++ gawk \
-            gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
-            python3-distutils python3-setuptools rsync swig unzip zlib1g-dev \
-            file wget qemu-utils libelf-dev ecj fastjar java-propose-classpath
-          sudo -E apt-get -qq autoremove --purge
-          sudo -E apt-get -qq clean
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib gettext git libncurses5-dev libssl-dev python3-distutils \
+            python3-setuptools rsync swig unzip zlib1g-dev file wget ca-certificates \
+            python3 python3-pip libelf-dev ecj fastjar java-propose-classpath
 
-      - name: Cache download directory
-        if: steps.check.outputs.has_update == 'true'
-        uses: actions/cache@v4
-        with:
-          path: openwrt/dl
-          key: dl-${{ steps.probe.outputs.upstream_short }}
-          restore-keys: |
-            dl-
-
-      - name: Update and install feeds
-        if: steps.check.outputs.has_update == 'true'
+      - name: Update & install feeds
+        if: env.SHOULD_BUILD == 'true'
         working-directory: openwrt
-        timeout-minutes: 15
         run: |
-          ./scripts/feeds update -a || { sleep 5; ./scripts/feeds update -a; }
+          ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Generate .config
-        if: steps.check.outputs.has_update == 'true'
+      - name: Apply defconfig & lock single device
+        if: env.SHOULD_BUILD == 'true'
         working-directory: openwrt
         run: |
-          rm -f .config
-          if [ ! -f "$DEFCONFIG_FILE" ]; then
-            echo "ERROR: defconfig not found: $DEFCONFIG_FILE"
-            ls -la defconfig/ || true
-            exit 1
-          fi
-          echo "==== raw defconfig CONFIG_TARGET lines ===="
-          grep -E "CONFIG_TARGET" "$DEFCONFIG_FILE" || echo "(none)"
-          cp "$DEFCONFIG_FILE" .config
+          cp "../$DEFCFG_FILE" .config
           make defconfig
+          echo "---- locked device(s) in .config ----"
+          grep -E 'CONFIG_TARGET_DEVICE_' .config | grep '=y' || true
+          echo "-------------------------------------"
 
-          echo "==== after make defconfig: selected devices ===="
-          grep "^CONFIG_TARGET_.*_DEVICE_.*=y" .config || true
-
-          DEVICE_LINE=$(grep "^CONFIG_TARGET_${CFG_TARGET}_${CFG_SUBTARGET}_DEVICE_.*=y" .config | head -1)
-          if [ -z "$DEVICE_LINE" ]; then
-            echo "FATAL: no device selected under ${CFG_TARGET}/${CFG_SUBTARGET}."
-            grep "CONFIG_TARGET_.*_DEVICE_" .config || echo "(none at all)"
-            exit 1
-          fi
-          DEVICE_NAME=$(echo "$DEVICE_LINE" | sed -E "s/^CONFIG_TARGET_${CFG_TARGET}_${CFG_SUBTARGET}_DEVICE_(.*)=y$/\1/")
-          [ -z "$DEVICE_NAME" ] && { echo "FATAL: parse device name failed: $DEVICE_LINE"; exit 1; }
-          echo "TARGET_DEVICE=$DEVICE_NAME" >> "$GITHUB_ENV"
-          echo "==== TARGET_DEVICE = $DEVICE_NAME ===="
-
-          sed -i 's/^CONFIG_TARGET_MULTI_PROFILE=y/# CONFIG_TARGET_MULTI_PROFILE is not set/' .config
-          sed -i 's/^CONFIG_TARGET_PER_DEVICE_ROOTFS=y/# CONFIG_TARGET_PER_DEVICE_ROOTFS is not set/' .config
-          make defconfig
-
-          echo "==== FINAL selected devices (must be exactly 1) ===="
-          FINAL=$(grep "^CONFIG_TARGET_.*_DEVICE_.*=y" .config)
-          echo "$FINAL"
-          N=$(echo "$FINAL" | grep -c .)
-          [ "$N" != "1" ] && { echo "FATAL: expected 1 device, got $N"; exit 1; }
-          echo "$FINAL" | grep -q "$DEVICE_NAME" || { echo "FATAL: final device != $DEVICE_NAME"; exit 1; }
-          echo "OK: single device $DEVICE_NAME confirmed."
-
-      - name: Patch mirrors and download sources
-        if: steps.check.outputs.has_update == 'true'
-        timeout-minutes: 30
+      - name: Download sources
+        if: env.SHOULD_BUILD == 'true'
         working-directory: openwrt
-        run: |
-          find dl -type f -size 0 -delete 2>/dev/null || true
-          find dl -name "*.aria2" -delete 2>/dev/null || true
-          find dl -name "*.tmp" -delete 2>/dev/null || true
-
-          echo "==== removing bad mirrors ===="
-          grep -rl "mirror\.iscas\.ac\.cn" . --include="*.pl" --include="*.mk" --include="*.sh" --include="Makefile" 2>/dev/null | while read -r f; do
-            echo "  patching: $f"
-            sed -i '/mirror\.iscas\.ac\.cn/d' "$f"
-          done
-          echo "  iscas remaining: $(grep -r 'mirror\.iscas\.ac\.cn' . 2>/dev/null | grep -v '.git/' | wc -l)"
-
-          echo "==== reducing curl timeouts ===="
-          grep -rl "\-\-connect-timeout" . --include="*.pl" --include="*.mk" --include="*.sh" 2>/dev/null | while read -r f; do
-            sed -i 's/--connect-timeout [0-9]\+/--connect-timeout 10/g' "$f"
-            sed -i 's/--retry [0-9]\+/--retry 2/g' "$f"
-          done
-
-          ok=0
-          for i in 1 2 3; do
-            echo "==== download attempt $i (-j24) ===="
-            if timeout --kill-after=30 600 make download -j24 V=s 2>&1 | tail -50; then ok=1; break; fi
-            find dl -type f -size 0 -delete 2>/dev/null || true
-            sleep 5
-          done
-          if [ "$ok" != "1" ]; then
-            echo "==== serial fallback (-j1) ===="
-            timeout --kill-after=30 600 make download -j1 V=s 2>&1 | tail -100 && ok=1
-          fi
-          [ "$ok" != "1" ] && { echo "ERROR: download failed"; exit 1; }
-          echo "==== download complete: $(ls -1 dl | wc -l) files, $(du -sh dl | cut -f1) ===="
+        run: make download -j8 V=s || make download -j1 V=s
 
       - name: Build firmware
-        if: steps.check.outputs.has_update == 'true'
-        timeout-minutes: 120
+        if: env.SHOULD_BUILD == 'true'
+        working-directory: openwrt
+        run: make -j$(nproc) V=s
+
+      - name: Collect firmware (no filtering, fail if empty)
+        if: env.SHOULD_BUILD == 'true'
+        id: collect
         working-directory: openwrt
         run: |
-          make -j$(nproc) V=s 2>&1 | tail -200 || make -j1 V=s 2>&1 | tail -200
+          mkdir -p "$GITHUB_WORKSPACE/release"
+          find bin/targets -type f \( -name '*-sysupgrade.bin' -o -name '*-factory.bin' \) \
+            -exec cp -v {} "$GITHUB_WORKSPACE/release/" \;
+          echo "==== collected files ===="
+          ls -lh "$GITHUB_WORKSPACE/release/" || true
+          N=$(find "$GITHUB_WORKSPACE/release/" -type f \( -name '*-sysupgrade.bin' -o -name '*-factory.bin' \) | wc -l)
+          echo "firmware count = $N"
+          if [ "$N" -lt 1 ]; then echo "FATAL: no firmware produced"; exit 1; fi
 
-      - name: Collect all build outputs
-        if: steps.check.outputs.has_update == 'true'
-        id: fw
+      - name: Build rich release notes
+        if: env.SHOULD_BUILD == 'true'
+        working-directory: openwrt
         run: |
-          DEVICE="${TARGET_DEVICE}"
-          echo "==== device: $DEVICE ===="
-          echo "==== openwrt/bin tree (top 2 levels) ===="
-          find openwrt/bin -maxdepth 2 | sort || true
-          echo "==== total size of openwrt/bin ===="
-          du -sh openwrt/bin || true
-
-          rm -rf release
-          mkdir -p release
-          cp -a openwrt/bin/. release/
-
-          FW_COUNT=$(find release/targets -type f \( -name "*.bin" -o -name "*.img" -o -name "*.ubi" -o -name "*.itb" -o -name "*.trx" \) 2>/dev/null | wc -l)
-          echo "==== firmware image files in targets: $FW_COUNT ===="
-          find release/targets -type f \( -name "*.bin" -o -name "*.img" -o -name "*.ubi" -o -name "*.itb" -o -name "*.trx" \) 2>/dev/null | sort
-
-          IPK_COUNT=$(find release -type f -name "*.ipk" 2>/dev/null | wc -l)
-          echo "==== ipk packages: $IPK_COUNT ===="
-
-          PACK_NAME="immortalwrt-${DEVICE}-${{ env.BUILD_DATE }}-all.tar.gz"
-          tar -czf "$PACK_NAME" -C release .
-          echo "==== packed: $PACK_NAME ($(du -h "$PACK_NAME" | cut -f1)) ===="
-
-          mkdir -p release_fw
-          find release/targets -type f \( -name "*.bin" -o -name "*.img" -o -name "*.ubi" -o -name "*.itb" -o -name "*.trx" \) -exec cp -v {} release_fw/ \; 2>/dev/null || true
-          find release/targets -maxdepth 3 -type f \( -name "*.manifest" -o -name "sha256sums" -o -name "*.buildinfo" -o -name "profiles.json" \) -exec cp -v {} release_fw/ \; 2>/dev/null || true
-
-          [ "$FW_COUNT" -lt 1 ] && { echo "FATAL: no firmware image built."; exit 1; }
-          [ ! -s "$PACK_NAME" ] && { echo "FATAL: tar.gz is empty"; exit 1; }
-
-          echo "fw_count=$FW_COUNT" >> "$GITHUB_OUTPUT"
-          echo "ipk_count=$IPK_COUNT" >> "$GITHUB_OUTPUT"
-          echo "pack_name=$PACK_NAME" >> "$GITHUB_OUTPUT"
-          echo "==== collect done ===="
-          ls -lh "$PACK_NAME"
-          ls -lh release_fw/
-
-      - name: Upload full bin as artifact
-        if: steps.check.outputs.has_update == 'true' && steps.fw.outputs.fw_count != '0'
-        uses: actions/upload-artifact@v4
-        with:
-          name: bin-${{ env.TARGET_DEVICE }}-${{ env.BUILD_DATE }}
-          path: release/
-          retention-days: 7
+          BIN=$(find "$GITHUB_WORKSPACE/release/" -name '*-sysupgrade.bin' | head -1)
+          MANIFEST=$(find bin/targets -name '*.manifest' | head -1)
+          PJSON=$(find bin/targets -name 'profiles.json' | head -1)
+          SIZE=$(ls -lh "$BIN" | awk '{print $5}')
+          VER=$(grep -oE '"version_number": *"[^"]*"' "$PJSON" | head -1 | cut -d'"' -f4)
+          VCODE=$(grep -oE '"version_code": *"[^"]*"' "$PJSON" | head -1 | cut -d'"' -f4)
+          PKGS=$(awk -F' - ' '{print $1}' "$MANIFEST" | sort | paste -sd ', ')
+          {
+            echo "## 固件信息"
+            echo "- 型号：$DEVICE_NAME"
+            echo "- 版本：${VER:-unknown} (${VCODE:-unknown})"
+            echo "- 上游 commit：${UP_SHA:0:10}"
+            echo "- 编译指纹：$FP"
+            echo "- 固件大小：$SIZE"
+            echo "- 默认管理 IP：$DEFAULT_IP"
+            echo "- 编译时间：$BUILD_DATE (Asia/Shanghai)"
+            echo ""
+            echo "## 内置软件包"
+            echo "$PKGS" | tr ',' '\n' | sed 's/^/- /'
+            echo ""
+            echo "## 怎么更新"
+            echo "1. LuCI：系统 → 备份/升级 → 上传 *sysupgrade.bin*，按需勾选保留配置。"
+            echo "2. 命令行：\`sysupgrade -n /tmp/<固件名>\`（-n 不保留配置，首次或跨大版本建议加）。"
+            echo "3. 升级前先备份配置；跨大版本建议不保留配置。"
+          } > /tmp/notes.md
+          cat /tmp/notes.md
 
       - name: Create GitHub Release
-        if: steps.check.outputs.has_update == 'true' && steps.fw.outputs.fw_count != '0'
-        id: release
+        if: env.SHOULD_BUILD == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-${{ env.BUILD_DATE }}-${{ steps.probe.outputs.upstream_short }}
-          name: "Firmware ${{ env.TARGET_DEVICE }} @ ${{ env.BUILD_DATE }}"
-          body: |
-            Auto build from upstream.
-            - Upstream commit: ${{ steps.probe.outputs.upstream_sha }}
-            - Device: ${{ env.TARGET_DEVICE }}
-            - Defconfig: ${{ env.DEFCONFIG_FILE }}
-            - Build time: ${{ env.BUILD_DATE }}
-            - Firmware images: ${{ steps.fw.outputs.fw_count }}
-            - IPK packages: ${{ steps.fw.outputs.ipk_count }}
-
-            **下载说明**
-            - `*-all.tar.gz`：完整产物包（固件 + 全部 ipk + manifest + buildinfo + profiles.json + sha256sums，解压后结构同本地 `bin/`）
-            - 其余 `.bin`：固件单独列出，可直接下载刷机
+          tag_name: build-${{ env.FP }}-${{ env.DEVICE_NAME }}
+          name: ${{ env.DEVICE_NAME }} @ ${{ env.BUILD_DATE }} (fp ${{ env.FP }})
+          body_path: /tmp/notes.md
           files: |
-            ${{ steps.fw.outputs.pack_name }}
-            release_fw/*
-          prerelease: false
+            release/*-sysupgrade.bin
+            release/*-factory.bin
 
-      # 只有 release 真成功，才记下 sha —— 编砸不前进，下次自动重试
-      - name: Record built sha (only after successful release)
-        if: steps.check.outputs.has_update == 'true' && steps.release.outcome == 'success'
-        id: record
-        run: echo "${{ steps.probe.outputs.upstream_sha }}" > .last_sha
-
-      # save 挪到末尾，且仅 record 成功才存
-      - name: Save last-built sha cache
-        if: steps.record.outcome == 'success'
-        uses: actions/cache@v4
-        with:
-          path: .last_sha
-          key: last-built-sha-${{ github.run_id }}
+      - name: Skip notice
+        if: env.SHOULD_BUILD != 'true'
+        run: echo "No build needed: release already up-to-date for current fingerprint. Done."
