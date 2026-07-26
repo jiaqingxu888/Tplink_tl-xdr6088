@@ -27,6 +27,7 @@ env:
 jobs:
   check-and-build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 180
     steps:
 
       - name: Set timezone
@@ -61,9 +62,7 @@ jobs:
         run: |
           UP="${{ steps.probe.outputs.upstream_sha }}"
           LAST=""
-          if [ -f .last_sha ]; then
-            LAST=$(cat .last_sha)
-          fi
+          [ -f .last_sha ] && LAST=$(cat .last_sha)
           echo "upstream=$UP last_built=$LAST"
           if [ "${{ github.event.inputs.force_build }}" = "true" ]; then
             HAS_UPDATE=true
@@ -93,24 +92,32 @@ jobs:
           cd openwrt
           echo "SRC_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
-      - name: Install build dependencies + aria2
+      - name: Install build dependencies
         if: steps.check.outputs.has_update == 'true'
         run: |
           sudo -E apt-get -qq update
           sudo -E apt-get -qq install -y build-essential clang flex bison g++ gawk \
             gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
             python3-distutils python3-setuptools rsync swig unzip zlib1g-dev \
-            file wget qemu-utils libelf-dev ecj fastjar java-propose-classpath \
-            aria2
+            file wget qemu-utils libelf-dev ecj fastjar java-propose-classpath
           sudo -E apt-get -qq autoremove --purge
           sudo -E apt-get -qq clean
-          echo "aria2c version: $(aria2c --version | head -1)"
+
+      - name: Cache download directory
+        if: steps.check.outputs.has_update == 'true'
+        uses: actions/cache@v4
+        with:
+          path: openwrt/dl
+          key: dl-${{ steps.probe.outputs.upstream_short }}
+          restore-keys: |
+            dl-
 
       - name: Update and install feeds
         if: steps.check.outputs.has_update == 'true'
         working-directory: openwrt
+        timeout-minutes: 15
         run: |
-          ./scripts/feeds update -a
+          ./scripts/feeds update -a || { sleep 5; ./scripts/feeds update -a; }
           ./scripts/feeds install -a
 
       - name: Generate .config
@@ -124,173 +131,97 @@ jobs:
             exit 1
           fi
           cp "$DEFCONFIG_FILE" .config
-          echo "==== step1: first defconfig to fully expand ===="
           make defconfig
-          echo "==== step2: force single device xdr6088 ===="
           sed -i 's/^CONFIG_TARGET_MULTI_PROFILE=y/# CONFIG_TARGET_MULTI_PROFILE is not set/' .config
           sed -i 's/^CONFIG_TARGET_PER_DEVICE_ROOTFS=y/# CONFIG_TARGET_PER_DEVICE_ROOTFS is not set/' .config
           sed -i -E 's/^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_(.*)=y/# CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_\1 is not set/' .config
           sed -i 's/^# CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_tplink_tl-xdr6088 is not set/CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_tplink_tl-xdr6088=y/' .config
-          if ! grep -q "^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_tplink_tl-xdr6088=y" .config; then
+          grep -q "^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_tplink_tl-xdr6088=y" .config || \
             echo "CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_tplink_tl-xdr6088=y" >> .config
-          fi
-          echo "==== step3: defconfig again to sync & apply edits ===="
           make defconfig
-          echo "==== verify: selected devices ===="
+          echo "==== selected devices ===="
           grep "^CONFIG_TARGET_DEVICE_.*=y" .config || true
-          echo "==== verify: MULTI_PROFILE ===="
-          grep "CONFIG_TARGET_MULTI_PROFILE" .config || echo "not set, good"
 
-      # ========== 缓存 dl/：key 只绑 sha，restore-keys 兜底裸 dl-，跨配置/跨小更新都能复用 ==========
-      - name: Cache download directory
+      - name: Patch mirrors and download sources
         if: steps.check.outputs.has_update == 'true'
-        uses: actions/cache@v4
-        with:
-          path: openwrt/dl
-          key: dl-${{ steps.probe.outputs.upstream_short }}
-          restore-keys: |
-            dl-
-
-      # ========== 缓存 build/：编译大头，增量编译靠它；key 绑 config+sha，restore 只回退到同配置，避免跨配置脏 .o ==========
-      - name: Cache build directory
-        if: steps.check.outputs.has_update == 'true'
-        uses: actions/cache@v4
-        with:
-          path: |
-            openwrt/build_dir
-            openwrt/staging_dir
-            openwrt/toolchain
-          key: build-${{ hashFiles('openwrt/.config') }}-${{ steps.probe.outputs.upstream_short }}
-          restore-keys: |
-            build-${{ hashFiles('openwrt/.config') }}-
-
-      # ========== aria2c 伪装 curl：含 hash 修复（rm 脏文件 + 去续传 + 探测回退真 curl）==========
-      - name: Create aria2c-based curl wrapper
-        if: steps.check.outputs.has_update == 'true'
-        run: |
-          mkdir -p "$HOME/bin"
-          cat > "$HOME/bin/curl" << 'WRAPPER'
-          #!/bin/bash
-          # aria2c masquerading as curl, with dirty-file purge to FIX hash mismatch
-          url=""
-          output=""
-          args=("$@")
-          i=0
-          while [ $i -lt ${#args[@]} ]; do
-            case "${args[$i]}" in
-              -o)
-                i=$((i+1)); output="${args[$i]}" ;;
-              -L|-f|-s|-S|-k|-I|--fail|--location|--silent|--show-error|--insecure|--head)
-                ;; # curl-only flags, skip
-              --connect-timeout|--retry|--retry-delay|--speed-limit|--speed-time|--max-time)
-                i=$((i+1)) ;; # curl timeout flags, skip (aria2c has its own)
-              -*)
-                ;; # skip other flags
-              *)
-                url="${args[$i]}" ;;
-            esac
-            i=$((i+1))
-          done
-          # No URL, or no -o (HEAD/probe requests) -> real curl, never aria2c
-          if [ -z "$url" ] || [ -z "$output" ]; then
-            exec /usr/bin/curl "$@"
-          fi
-          # CRITICAL FIX: purge leftover partial file + aria2 control file,
-          # otherwise aria2 "continues" from garbage -> wrong hash on every mirror
-          rm -f "$output" "${output}.aria2"
-          dir=$(dirname "$output")
-          file=$(basename "$output")
-          mkdir -p "$dir"
-          # 8 conns/file (not 16): with -j24 parallel files, 24*8=192 conns is the
-          # sweet spot; 16 would risk mirror rate-limiting and slow everyone down
-          exec aria2c \
-            --max-connection-per-server=8 \
-            --split=8 \
-            --min-split-size=1M \
-            --connect-timeout=10 \
-            --timeout=30 \
-            --max-tries=2 \
-            --retry-wait=2 \
-            --console-log-level=warn \
-            --summary-interval=0 \
-            --auto-file-renaming=false \
-            --allow-overwrite=true \
-            --file-allocation=none \
-            --disable-ipv6=true \
-            --dir="$dir" --out="$file" \
-            "$url"
-          WRAPPER
-          chmod +x "$HOME/bin/curl"
-          echo "$HOME/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/bin:$PATH"
-          echo "WRAPPER_CHECK: curl resolves to → $(which curl)"
-          echo "aria2c binary → $(which aria2c)"
-          echo "NOTE: --continue removed; dirty files purged before each download"
-
-      # ========== 下载：-j24 并发 + 30s 超时 + 心跳打印 dl 进度（让你看得见它在干活）==========
-      - name: Download sources
-        if: steps.check.outputs.has_update == 'true'
-        timeout-minutes: 20
+        timeout-minutes: 30
         working-directory: openwrt
         run: |
-          export PATH="$HOME/bin:$PATH"
-          # heartbeat: print dl/ file count + size every 20s so the log never looks "dead"
-          ( while true; do
-              n=$(ls -1 dl 2>/dev/null | wc -l | tr -d ' ')
-              sz=$(du -sh dl 2>/dev/null | cut -f1)
-              echo "[heartbeat $(date +%H:%M:%S)] dl/ = ${n} files, ${sz:-0}"
-              sleep 20
-            done ) &
-          HB=$!
-          trap 'kill $HB 2>/dev/null' EXIT
+          # ===== 1. 清理缓存中的脏文件 =====
+          find dl -type f -size 0 -delete 2>/dev/null || true
+          find dl -name "*.aria2" -delete 2>/dev/null || true
+          find dl -name "*.tmp" -delete 2>/dev/null || true
 
+          # ===== 2. 全仓库搜索并删除不稳定镜像 =====
+          # 不猜文件位置，grep找到就删
+          echo "==== removing bad mirrors ===="
+          grep -rl "mirror\.iscas\.ac\.cn" . --include="*.pl" --include="*.mk" --include="*.sh" --include="Makefile" --include="rules.mk" 2>/dev/null | while read -r f; do
+            echo "  patching: $f"
+            sed -i '/mirror\.iscas\.ac\.cn/d' "$f"
+          done
+          # 验证
+          REMAINING=$(grep -r "mirror\.iscas\.ac\.cn" . 2>/dev/null | grep -v ".git/" | wc -l)
+          echo "  iscas references remaining: $REMAINING"
+
+          # ===== 3. 全仓库缩短curl超时 =====
+          echo "==== reducing curl timeouts ===="
+          grep -rl "\-\-connect-timeout" . --include="*.pl" --include="*.mk" --include="*.sh" 2>/dev/null | while read -r f; do
+            echo "  patching timeout in: $f"
+            sed -i 's/--connect-timeout [0-9]\+/--connect-timeout 10/g' "$f"
+            sed -i 's/--retry [0-9]\+/--retry 2/g' "$f"
+          done
+
+          # ===== 4. 下载：3次并发 + 1次串行兜底 =====
           ok=0
           for i in 1 2 3; do
-            echo "==== download attempt $i (aria2c 8-conn/file, -j24 parallel, 30s/mirror) ===="
-            if timeout --kill-after=20 600 make download -j24 V=s; then
+            echo "==== download attempt $i (-j24) ===="
+            if timeout --kill-after=30 600 make download -j24 V=s 2>&1 | tail -50; then
               ok=1
               break
             fi
-            echo "attempt $i incomplete; cached/clean files skipped on retry"
-            sleep 3
+            echo "attempt $i failed, cleaning partial files..."
+            find dl -type f -size 0 -delete 2>/dev/null || true
+            sleep 5
           done
           if [ "$ok" != "1" ]; then
-            echo "==== serial fallback ===="
-            if timeout --kill-after=20 600 make download -j1 V=s; then
+            echo "==== serial fallback (-j1) ===="
+            if timeout --kill-after=30 600 make download -j1 V=s 2>&1 | tail -100; then
               ok=1
             fi
           fi
-          kill $HB 2>/dev/null || true
           if [ "$ok" != "1" ]; then
-            echo "ERROR: some sources still missing after all retries"
+            echo "ERROR: download failed after all retries"
+            echo "Files in dl/: $(ls -1 dl 2>/dev/null | wc -l)"
             exit 1
           fi
-          echo "==== all sources downloaded ===="
-          echo "final dl/ = $(ls -1 dl 2>/dev/null | wc -l | tr -d ' ') files, $(du -sh dl 2>/dev/null | cut -f1)"
+          echo "==== download complete: $(ls -1 dl | wc -l) files, $(du -sh dl | cut -f1) ===="
 
       - name: Build firmware
         if: steps.check.outputs.has_update == 'true'
+        timeout-minutes: 120
         working-directory: openwrt
         run: |
-          make toolchain/install -j$(nproc) V=s
-          make -j$(nproc) V=s || make -j1 V=s
+          make -j$(nproc) V=s 2>&1 | tail -200 || make -j1 V=s 2>&1 | tail -200
 
       - name: Collect firmware images
         if: steps.check.outputs.has_update == 'true'
         id: fw
         run: |
           mkdir -p firmware
-          find openwrt/bin/targets -type f \( -name "*.bin" -o -name "*.img" -o -name "*.ubi" -o -name "*.itb" -o -name "*.trx" \) -exec cp -v {} firmware/ \;
+          find openwrt/bin/targets -type f \( -name "*.bin" -o -name "*.img" -o -name "*.ubi" -o -name "*.itb" -o -name "*.trx" -o -name "*.tar.gz" \) -exec cp -v {} firmware/ \; 2>/dev/null || true
           cd firmware
+          # 只保留目标设备的文件
+          count=0
           for f in *; do
+            [ "$f" = "*" ] && break
             case "$f" in
-              *xdr6088*) ;;
+              *xdr6088*|*XDR6088*) count=$((count+1)) ;;
               *) rm -f "$f" ;;
             esac
           done
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          [ "$count" -gt 0 ] && sha256sum * > SHA256SUMS 2>/dev/null || true
           ls -lh
-          echo "count=$(ls -1 2>/dev/null | grep -c .)" >> "$GITHUB_OUTPUT"
-          sha256sum * > SHA256SUMS 2>/dev/null || true
 
       - name: Upload artifact
         if: steps.check.outputs.has_update == 'true' && steps.fw.outputs.count != '0'
@@ -304,7 +235,7 @@ jobs:
         if: steps.check.outputs.has_update == 'true' && steps.fw.outputs.count != '0'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-${{ env.BUILD_DATE }}
+          tag_name: build-${{ env.BUILD_DATE }}-${{ steps.probe.outputs.upstream_short }}
           name: "Firmware ${{ env.MAIN_DEVICE }} @ ${{ env.BUILD_DATE }}"
           body: |
             Auto build from upstream.
