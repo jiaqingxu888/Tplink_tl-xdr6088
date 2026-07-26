@@ -187,8 +187,8 @@ jobs:
         if: env.SHOULD_BUILD == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-${{ env.FP }}-${{ env.DEVICE_NAME }}
-          name: ${{ env.DEVICE_NAME }} @ ${{ env.BUILD_DATE }} fp ${{ env.FP }}
+          tag_name: 'build-${{ env.FP }}-${{ env.DEVICE_NAME }}'
+          name: '${{ env.DEVICE_NAME }} @ ${{ env.BUILD_DATE }} fp ${{ env.FP }}'
           body_path: /tmp/notes.md
           files: |
             release/*-sysupgrade.bin
