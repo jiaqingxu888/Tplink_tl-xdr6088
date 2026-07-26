@@ -106,16 +106,6 @@ jobs:
           sudo -E apt-get -qq clean
           echo "aria2c version: $(aria2c --version | head -1)"
 
-      # ========== 缓存 dl/（稳定 key，跨 run 复用，重复构建省 80%+ 时间）==========
-      - name: Cache download directory
-        if: steps.check.outputs.has_update == 'true'
-        uses: actions/cache@v4
-        with:
-          path: openwrt/dl
-          key: dl-${{ hashFiles('openwrt/.config') }}-${{ steps.probe.outputs.upstream_short }}
-          restore-keys: |
-            dl-
-
       - name: Update and install feeds
         if: steps.check.outputs.has_update == 'true'
         working-directory: openwrt
@@ -151,14 +141,37 @@ jobs:
           echo "==== verify: MULTI_PROFILE ===="
           grep "CONFIG_TARGET_MULTI_PROFILE" .config || echo "not set, good"
 
-      # ========== aria2c 伪装成 curl（16 连接并行拉同一个文件，速度 ×5~10）==========
+      # ========== 缓存 dl/：key 只绑 sha，restore-keys 兜底裸 dl-，跨配置/跨小更新都能复用 ==========
+      - name: Cache download directory
+        if: steps.check.outputs.has_update == 'true'
+        uses: actions/cache@v4
+        with:
+          path: openwrt/dl
+          key: dl-${{ steps.probe.outputs.upstream_short }}
+          restore-keys: |
+            dl-
+
+      # ========== 缓存 build/：编译大头，增量编译靠它；key 绑 config+sha，restore 只回退到同配置，避免跨配置脏 .o ==========
+      - name: Cache build directory
+        if: steps.check.outputs.has_update == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            openwrt/build_dir
+            openwrt/staging_dir
+            openwrt/toolchain
+          key: build-${{ hashFiles('openwrt/.config') }}-${{ steps.probe.outputs.upstream_short }}
+          restore-keys: |
+            build-${{ hashFiles('openwrt/.config') }}-
+
+      # ========== aria2c 伪装 curl：含 hash 修复（rm 脏文件 + 去续传 + 探测回退真 curl）==========
       - name: Create aria2c-based curl wrapper
         if: steps.check.outputs.has_update == 'true'
         run: |
           mkdir -p "$HOME/bin"
           cat > "$HOME/bin/curl" << 'WRAPPER'
           #!/bin/bash
-          # aria2c masquerading as curl for OpenWrt download.pl
+          # aria2c masquerading as curl, with dirty-file purge to FIX hash mismatch
           url=""
           output=""
           args=("$@")
@@ -167,7 +180,7 @@ jobs:
             case "${args[$i]}" in
               -o)
                 i=$((i+1)); output="${args[$i]}" ;;
-              -L|-f|-s|-S|-k|--fail|--location|--silent|--show-error|--insecure)
+              -L|-f|-s|-S|-k|-I|--fail|--location|--silent|--show-error|--insecure|--head)
                 ;; # curl-only flags, skip
               --connect-timeout|--retry|--retry-delay|--speed-limit|--speed-time|--max-time)
                 i=$((i+1)) ;; # curl timeout flags, skip (aria2c has its own)
@@ -178,55 +191,67 @@ jobs:
             esac
             i=$((i+1))
           done
-          if [ -z "$url" ]; then
+          # No URL, or no -o (HEAD/probe requests) -> real curl, never aria2c
+          if [ -z "$url" ] || [ -z "$output" ]; then
             exec /usr/bin/curl "$@"
           fi
-          aria2_args=(
-            --max-connection-per-server=16
-            --split=16
-            --min-split-size=1M
-            --connect-timeout=10
-            --timeout=30
-            --max-tries=2
-            --retry-wait=2
-            --console-log-level=warn
-            --summary-interval=0
-            --auto-file-renaming=false
-            --allow-overwrite=true
-            --file-allocation=none
-            --disable-ipv6=true
-            --continue=true
-          )
-          if [ -n "$output" ]; then
-            dir=$(dirname "$output")
-            file=$(basename "$output")
-            mkdir -p "$dir"
-            aria2_args+=(--dir="$dir" --out="$file")
-          fi
-          exec aria2c "${aria2_args[@]}" "$url"
+          # CRITICAL FIX: purge leftover partial file + aria2 control file,
+          # otherwise aria2 "continues" from garbage -> wrong hash on every mirror
+          rm -f "$output" "${output}.aria2"
+          dir=$(dirname "$output")
+          file=$(basename "$output")
+          mkdir -p "$dir"
+          # 8 conns/file (not 16): with -j24 parallel files, 24*8=192 conns is the
+          # sweet spot; 16 would risk mirror rate-limiting and slow everyone down
+          exec aria2c \
+            --max-connection-per-server=8 \
+            --split=8 \
+            --min-split-size=1M \
+            --connect-timeout=10 \
+            --timeout=30 \
+            --max-tries=2 \
+            --retry-wait=2 \
+            --console-log-level=warn \
+            --summary-interval=0 \
+            --auto-file-renaming=false \
+            --allow-overwrite=true \
+            --file-allocation=none \
+            --disable-ipv6=true \
+            --dir="$dir" --out="$file" \
+            "$url"
           WRAPPER
           chmod +x "$HOME/bin/curl"
           echo "$HOME/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/bin:$PATH"
           echo "WRAPPER_CHECK: curl resolves to → $(which curl)"
           echo "aria2c binary → $(which aria2c)"
-          head -2 "$HOME/bin/curl"
+          echo "NOTE: --continue removed; dirty files purged before each download"
 
-      # ========== 下载（aria2c 16 线程 + 30s 超时 + -j16 并行）==========
+      # ========== 下载：-j24 并发 + 30s 超时 + 心跳打印 dl 进度（让你看得见它在干活）==========
       - name: Download sources
         if: steps.check.outputs.has_update == 'true'
         timeout-minutes: 20
         working-directory: openwrt
         run: |
           export PATH="$HOME/bin:$PATH"
+          # heartbeat: print dl/ file count + size every 20s so the log never looks "dead"
+          ( while true; do
+              n=$(ls -1 dl 2>/dev/null | wc -l | tr -d ' ')
+              sz=$(du -sh dl 2>/dev/null | cut -f1)
+              echo "[heartbeat $(date +%H:%M:%S)] dl/ = ${n} files, ${sz:-0}"
+              sleep 20
+            done ) &
+          HB=$!
+          trap 'kill $HB 2>/dev/null' EXIT
+
           ok=0
           for i in 1 2 3; do
-            echo "==== download attempt $i (aria2c 16-conn, 30s per mirror, -j16 parallel) ===="
-            if timeout --kill-after=20 600 make download -j16 V=s; then
+            echo "==== download attempt $i (aria2c 8-conn/file, -j24 parallel, 30s/mirror) ===="
+            if timeout --kill-after=20 600 make download -j24 V=s; then
               ok=1
               break
             fi
-            echo "attempt $i incomplete; cached files will be skipped on retry"
+            echo "attempt $i incomplete; cached/clean files skipped on retry"
             sleep 3
           done
           if [ "$ok" != "1" ]; then
@@ -235,11 +260,13 @@ jobs:
               ok=1
             fi
           fi
+          kill $HB 2>/dev/null || true
           if [ "$ok" != "1" ]; then
             echo "ERROR: some sources still missing after all retries"
             exit 1
           fi
           echo "==== all sources downloaded ===="
+          echo "final dl/ = $(ls -1 dl 2>/dev/null | wc -l | tr -d ' ') files, $(du -sh dl 2>/dev/null | cut -f1)"
 
       - name: Build firmware
         if: steps.check.outputs.has_update == 'true'
