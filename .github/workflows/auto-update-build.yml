@@ -19,7 +19,7 @@ permissions:
 
 concurrency:
   group: auto-update-build
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   UPSTREAM_REPO: https://github.com/padavanonly/immortalwrt-mt798x-6.6.git
@@ -74,17 +74,13 @@ jobs:
           fi
           REASON=""
           if [ "$FORCE" = "true" ]; then
-            SB=true
-            REASON="force_build is true"
+            SB=true; REASON="force_build is true"
           elif [ -z "$LAST_FP" ]; then
-            SB=true
-            REASON="no matching release found"
+            SB=true; REASON="no matching release found"
           elif [ "$LAST_FP" != "$FP" ]; then
-            SB=true
-            REASON="fingerprint changed"
+            SB=true; REASON="fingerprint changed"
           else
-            SB=false
-            REASON="release already has matching firmware"
+            SB=false; REASON="release already has matching firmware"
           fi
           echo "================ DECIDE ================"
           echo "upstream HEAD  = $UP_SHA"
@@ -122,21 +118,28 @@ jobs:
         working-directory: openwrt
         run: |
           if [ ! -f "../$DEFCFG_FILE" ]; then
-            echo "FATAL defconfig not found in your repo: $DEFCFG_FILE"
-            exit 1
+            echo "FATAL defconfig not found in your repo: $DEFCFG_FILE"; exit 1
           fi
           cp "../$DEFCFG_FILE" .config
           make defconfig
-          echo "---- locked device(s) ----"
-          grep -E 'CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_' .config | grep '=y' || true
-          echo "--------------------------"
-          grep -q 'CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_tplink_tl-xdr6088=y' .config || { echo "FATAL xdr6088 not locked"; exit 1; }
-          OTHER=$(grep -E 'CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_' .config | grep '=y' | grep -v 'tplink_tl-xdr6088' || true)
-          if [ -n "$OTHER" ]; then
-            echo "WARN extra devices still enabled (will be filtered at collect):"
-            echo "$OTHER"
+          echo "================ X-RAY: target/device lines in .config AFTER make defconfig ================"
+          grep -E '^#? ?CONFIG_TARGET_' .config | grep -E 'mediatek|filogic|DEVICE_|HAS_SUBTARGETS|MULTI_PROFILE|PER_DEVICE' || echo "(no target lines matched)"
+          echo "=========================================================================================="
+          echo "---- device switches that are =y ----"
+          grep -E 'CONFIG_TARGET_.*_DEVICE_.*=y' .config || echo "(none)"
+          echo "-------------------------------------"
+          if grep -qE 'CONFIG_TARGET_.*_DEVICE_tplink_tl-xdr6088=y' .config; then
+            echo "OK xdr6088 is selected (exact symbol name shown above)"
+          else
+            echo "FATAL xdr6088 NOT selected after make defconfig -> your defconfig device line prefix is wrong"
+            echo "HINT the device SWITCH must be CONFIG_TARGET_mediatek_filogic_DEVICE_tplink_tl-xdr6088=y"
+            echo "HINT (NOT CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_... and you also need CONFIG_TARGET_mediatek_filogic=y)"
+            exit 1
           fi
-          echo "OK device locked = tplink_tl-xdr6088"
+          OTHER=$(grep -E 'CONFIG_TARGET_.*_DEVICE_.*=y' .config | grep -v 'tplink_tl-xdr6088' || true)
+          if [ -n "$OTHER" ]; then
+            echo "WARN extra devices still enabled (filtered at collect step):"; echo "$OTHER"
+          fi
 
       - name: Download sources
         if: "env.SHOULD_BUILD == 'true'"
@@ -158,10 +161,7 @@ jobs:
           ls -lh "$GITHUB_WORKSPACE/release/" || true
           N=$(find "$GITHUB_WORKSPACE/release/" -type f \( -name '*-sysupgrade.bin' -o -name '*-factory.bin' \) | wc -l)
           echo "firmware count = $N"
-          if [ "$N" -lt 1 ]; then
-            echo "FATAL no xdr6088 firmware produced"
-            exit 1
-          fi
+          if [ "$N" -lt 1 ]; then echo "FATAL no xdr6088 firmware produced"; exit 1; fi
 
       - name: Build rich release notes
         if: "env.SHOULD_BUILD == 'true'"
@@ -192,8 +192,7 @@ jobs:
           echo "1. LuCI 系统 - 备份/升级 - 上传 sysupgrade.bin，按需勾选保留配置。" >> "$OUT"
           echo "2. 命令行 sysupgrade -n /tmp/固件名 （-n 不保留配置，首次或跨大版本建议加）。" >> "$OUT"
           echo "3. 升级前先备份配置；跨大版本建议不保留配置。" >> "$OUT"
-          echo "---- notes preview ----"
-          cat "$OUT"
+          echo "---- notes preview ----"; cat "$OUT"
 
       - name: Create GitHub Release
         if: "env.SHOULD_BUILD == 'true'"
