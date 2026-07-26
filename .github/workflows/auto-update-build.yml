@@ -2,9 +2,8 @@ name: Auto Update & Build Firmware
 
 on:
   schedule:
-    - cron: '0 4,10,16,22 * * *'   # 04/10/16/22 点各查一次
+    - cron: '0 4,10,16,22 * * *'
   push:
-    # 改配置或改本工作流，推上来就自动重判（指纹变了就会编）
     paths:
       - 'defconfig/**'
       - '.github/workflows/**'
@@ -16,7 +15,7 @@ on:
         default: false
 
 permissions:
-  contents: write   # 创建 release 必需
+  contents: write
 
 concurrency:
   group: auto-update-build
@@ -29,7 +28,7 @@ env:
   CFG_TARGET: mediatek
   CFG_SUBTARGET: filogic
   DEVICE_NAME: tplink_tl-xdr6088
-  DEFAULT_IP: 192.168.1.1          # 固件默认管理IP，如改过请改这里
+  DEFAULT_IP: '192.168.1.1'
   TZ: Asia/Shanghai
 
 jobs:
@@ -37,107 +36,96 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 240
     steps:
-      - name: Checkout this repo (for defconfig & workflow)
+      - name: Checkout this repo
         uses: actions/checkout@v4
 
-      - name: Set timezone & build date
+      - name: Set timezone and build date
         run: |
           sudo timedatectl set-timezone "$TZ"
           echo "BUILD_DATE=$(date +%Y%m%d-%H%M)" >> "$GITHUB_ENV"
 
       - name: Free disk space
         run: |
-          sudo swapoff -a && sudo rm -f /swapfile
+          sudo swapoff -a
+          sudo rm -f /swapfile
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo apt-get clean
           df -h
 
-      - name: Probe upstream + compute fingerprint + check release
+      - name: Probe upstream and compute fingerprint and check release
         id: decide
         env:
           FORCE: ${{ github.event.inputs.force_build }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          # 1) 上游当前 HEAD（不 clone，快）
           UP_SHA=$(git ls-remote "$UPSTREAM_REPO" "refs/heads/${UPSTREAM_BRANCH}" | awk '{print $1}')
-          if [ -z "$UP_SHA" ]; then echo "FATAL: cannot resolve upstream HEAD"; exit 1; fi
-
-          # 2) 编译指纹 = 上游sha + 配置内容 + 关键env
-          FP=$( {
-            echo "$UP_SHA"
-            cat "$DEFCFG_FILE"
-            echo "$CFG_TARGET|$CFG_SUBTARGET|$DEVICE_NAME|$DEFAULT_IP|$UPSTREAM_BRANCH"
-          } | sha256sum | cut -c1-12 )
-
-          # 3) 查最新 release 的 tag，提取其中的 12 位指纹；查不到/提取不到 => 空
-          HTTP=$(curl -sS -o /tmp/rel.json -w "%{http_code}" \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest" || true)
+          if [ -z "$UP_SHA" ]; then
+            echo "FATAL: cannot resolve upstream HEAD"
+            exit 1
+          fi
+          FP=$( ( echo "$UP_SHA"; cat "$DEFCFG_FILE"; echo "$CFG_TARGET|$CFG_SUBTARGET|$DEVICE_NAME|$DEFAULT_IP|$UPSTREAM_BRANCH" ) | sha256sum | cut -c1-12 )
+          HTTP=$(curl -sS -o /tmp/rel.json -w "%{http_code}" -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest" || true)
           LAST_FP=""
+          TAG=""
           if [ "$HTTP" = "200" ]; then
             TAG=$(jq -r '.tag_name // empty' /tmp/rel.json)
             LAST_FP=$(echo "$TAG" | grep -oE '[0-9a-f]{12}' | head -1 || true)
           fi
-
-          # 4) 多条件判定
           REASON=""
           if [ "$FORCE" = "true" ]; then
-            SB=true; REASON="force_build=true"
+            SB=true
+            REASON="force_build is true"
           elif [ -z "$LAST_FP" ]; then
-            SB=true; REASON="no matching release found (release empty or tag has no fingerprint)"
+            SB=true
+            REASON="no matching release found"
           elif [ "$LAST_FP" != "$FP" ]; then
-            SB=true; REASON="fingerprint changed (upstream/config/env changed)"
+            SB=true
+            REASON="fingerprint changed"
           else
-            SB=false; REASON="release already has firmware for current fingerprint"
+            SB=false
+            REASON="release already has matching firmware"
           fi
-
           echo "================ DECIDE ================"
-          echo "upstream HEAD   : $UP_SHA"
-          echo "current FP      : $FP"
-          echo "latest release  : ${TAG:-(none)}  -> fingerprint in tag: ${LAST_FP:-(none)}"
-          echo "SHOULD_BUILD    : $SB   ($REASON)"
+          echo "upstream HEAD    = $UP_SHA"
+          echo "current FP       = $FP"
+          echo "latest release   = ${TAG:-none}"
+          echo "release FP       = ${LAST_FP:-none}"
+          echo "SHOULD_BUILD     = $SB  ($REASON)"
           echo "========================================"
-
           echo "SHOULD_BUILD=$SB" >> "$GITHUB_ENV"
-          echo "FP=$FP"         >> "$GITHUB_ENV"
-          echo "UP_SHA=$UP_SHA"  >> "$GITHUB_ENV"
-
-      # ============ 以下全部仅在 SHOULD_BUILD=true 时执行 ============
+          echo "FP=$FP" >> "$GITHUB_ENV"
+          echo "UP_SHA=$UP_SHA" >> "$GITHUB_ENV"
 
       - name: Clone upstream source
         if: env.SHOULD_BUILD == 'true'
         run: |
           git clone --depth 1 -b "$UPSTREAM_BRANCH" "$UPSTREAM_REPO" openwrt
           cd openwrt
-          echo "cloned HEAD = $(git rev-parse HEAD)  (expect $UP_SHA)"
+          echo "cloned HEAD = $(git rev-parse HEAD) expect $UP_SHA"
 
       - name: Install build dependencies
         if: env.SHOULD_BUILD == 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential clang flex bison g++ gawk \
-            gcc-multilib gettext git libncurses5-dev libssl-dev python3-distutils \
-            python3-setuptools rsync swig unzip zlib1g-dev file wget ca-certificates \
-            python3 python3-pip libelf-dev ecj fastjar java-propose-classpath
+          sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib gettext git libncurses5-dev libssl-dev python3-distutils python3-setuptools rsync swig unzip zlib1g-dev file wget ca-certificates python3 python3-pip libelf-dev ecj fastjar java-propose-classpath
 
-      - name: Update & install feeds
+      - name: Update and install feeds
         if: env.SHOULD_BUILD == 'true'
         working-directory: openwrt
         run: |
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Apply defconfig & lock single device
+      - name: Apply defconfig and lock single device
         if: env.SHOULD_BUILD == 'true'
         working-directory: openwrt
         run: |
           cp "../$DEFCFG_FILE" .config
           make defconfig
-          echo "---- locked device(s) in .config ----"
+          echo "---- locked device(s) ----"
           grep -E 'CONFIG_TARGET_DEVICE_' .config | grep '=y' || true
-          echo "-------------------------------------"
+          echo "--------------------------"
 
       - name: Download sources
         if: env.SHOULD_BUILD == 'true'
@@ -149,19 +137,20 @@ jobs:
         working-directory: openwrt
         run: make -j$(nproc) V=s
 
-      - name: Collect firmware (no filtering, fail if empty)
+      - name: Collect firmware and fail if empty
         if: env.SHOULD_BUILD == 'true'
-        id: collect
         working-directory: openwrt
         run: |
           mkdir -p "$GITHUB_WORKSPACE/release"
-          find bin/targets -type f \( -name '*-sysupgrade.bin' -o -name '*-factory.bin' \) \
-            -exec cp -v {} "$GITHUB_WORKSPACE/release/" \;
+          find bin/targets -type f \( -name '*-sysupgrade.bin' -o -name '*-factory.bin' \) -exec cp -v {} "$GITHUB_WORKSPACE/release/" \;
           echo "==== collected files ===="
           ls -lh "$GITHUB_WORKSPACE/release/" || true
           N=$(find "$GITHUB_WORKSPACE/release/" -type f \( -name '*-sysupgrade.bin' -o -name '*-factory.bin' \) | wc -l)
           echo "firmware count = $N"
-          if [ "$N" -lt 1 ]; then echo "FATAL: no firmware produced"; exit 1; fi
+          if [ "$N" -lt 1 ]; then
+            echo "FATAL: no firmware produced"
+            exit 1
+          fi
 
       - name: Build rich release notes
         if: env.SHOULD_BUILD == 'true'
@@ -174,32 +163,32 @@ jobs:
           VER=$(grep -oE '"version_number": *"[^"]*"' "$PJSON" | head -1 | cut -d'"' -f4)
           VCODE=$(grep -oE '"version_code": *"[^"]*"' "$PJSON" | head -1 | cut -d'"' -f4)
           PKGS=$(awk -F' - ' '{print $1}' "$MANIFEST" | sort | paste -sd ', ')
-          {
-            echo "## 固件信息"
-            echo "- 型号：$DEVICE_NAME"
-            echo "- 版本：${VER:-unknown} (${VCODE:-unknown})"
-            echo "- 上游 commit：${UP_SHA:0:10}"
-            echo "- 编译指纹：$FP"
-            echo "- 固件大小：$SIZE"
-            echo "- 默认管理 IP：$DEFAULT_IP"
-            echo "- 编译时间：$BUILD_DATE (Asia/Shanghai)"
-            echo ""
-            echo "## 内置软件包"
-            echo "$PKGS" | tr ',' '\n' | sed 's/^/- /'
-            echo ""
-            echo "## 怎么更新"
-            echo "1. LuCI：系统 → 备份/升级 → 上传 *sysupgrade.bin*，按需勾选保留配置。"
-            echo "2. 命令行：\`sysupgrade -n /tmp/<固件名>\`（-n 不保留配置，首次或跨大版本建议加）。"
-            echo "3. 升级前先备份配置；跨大版本建议不保留配置。"
-          } > /tmp/notes.md
-          cat /tmp/notes.md
+          OUT=/tmp/notes.md
+          echo "## 固件信息" > "$OUT"
+          echo "- 型号：$DEVICE_NAME" >> "$OUT"
+          echo "- 版本：${VER:-unknown} (${VCODE:-unknown})" >> "$OUT"
+          echo "- 上游 commit：${UP_SHA:0:10}" >> "$OUT"
+          echo "- 编译指纹：$FP" >> "$OUT"
+          echo "- 固件大小：$SIZE" >> "$OUT"
+          echo "- 默认管理 IP：$DEFAULT_IP" >> "$OUT"
+          echo "- 编译时间：$BUILD_DATE (Asia/Shanghai)" >> "$OUT"
+          echo "" >> "$OUT"
+          echo "## 内置软件包" >> "$OUT"
+          echo "$PKGS" | tr ',' '\n' | sed 's/^/- /' >> "$OUT"
+          echo "" >> "$OUT"
+          echo "## 怎么更新" >> "$OUT"
+          echo "1. LuCI：系统 备份/升级 上传 sysupgrade.bin，按需勾选保留配置。" >> "$OUT"
+          echo "2. 命令行：sysupgrade -n /tmp/固件名  （-n 不保留配置，首次或跨大版本建议加）。" >> "$OUT"
+          echo "3. 升级前先备份配置；跨大版本建议不保留配置。" >> "$OUT"
+          echo "---- notes preview ----"
+          cat "$OUT"
 
       - name: Create GitHub Release
         if: env.SHOULD_BUILD == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ env.FP }}-${{ env.DEVICE_NAME }}
-          name: ${{ env.DEVICE_NAME }} @ ${{ env.BUILD_DATE }} (fp ${{ env.FP }})
+          name: ${{ env.DEVICE_NAME }} @ ${{ env.BUILD_DATE }} fp ${{ env.FP }}
           body_path: /tmp/notes.md
           files: |
             release/*-sysupgrade.bin
@@ -207,4 +196,4 @@ jobs:
 
       - name: Skip notice
         if: env.SHOULD_BUILD != 'true'
-        run: echo "No build needed: release already up-to-date for current fingerprint. Done."
+        run: echo "No build needed: release already up-to-date for current fingerprint."
