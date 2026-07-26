@@ -1,4 +1,3 @@
-
 name: Auto Update & Build Firmware
 
 # 触发：① 每 6 小时定时检测上游；② 手动 Run workflow（可强制编译）
@@ -13,25 +12,26 @@ on:
         type: boolean
         default: false
 
-# 同一时间只跑一个，避免重复编译 / push 冲突
 concurrency:
   group: auto-update-build
   cancel-in-progress: false
 
 env:
-  # ===== ① 上游（237 的库，已填好，无需改） =====
+  # ===== 上游源码（237 的库，已填好） =====
   UPSTREAM_REPO:   https://github.com/padavanonly/immortalwrt-mt798x-6.6.git
   UPSTREAM_BRANCH: openwrt-24.10-6.6
 
-  # ===== ② 用哪个 defconfig 文件（已填好，无需改） =====
-  # 该文件已含 MULTI_PROFILE，会同时产出 xdr6088 / xdr6086 / gl-mt6000 / redmi-ax6000-stock 等
+  # ===== 237 仓库里带调优的 defconfig（折中版要读它，已填好） =====
   DEFCONFIG_FILE:  defconfig/mt7986-ax6000_dae.config
 
-  # 仅用于产物命名/Release 文案展示，不影响编译
-  MAIN_DEVICE:     tplink_tl-xdr6088
+  # ===== 单机型目标（已填好；sed 砍机型 / 校验 / 文案都靠它） =====
+  # 注意：设备符号里 mediatek 与 filogic 之间是下划线 _
+  CFG_TARGET:    mediatek
+  CFG_SUBTARGET: filogic
+  CFG_DEVICE:    tplink_tl-xdr6088
 
-  # 是否把同步后的源码 push 回你自己的仓库（让 fork 始终最新）
-  PUSH_BACK:       true
+  # 仅用于产物命名/Release 文案
+  MAIN_DEVICE:   tplink_tl-xdr6088
 
   JOBS: 3
   TZ: Asia/Shanghai
@@ -54,58 +54,63 @@ jobs:
           sudo docker image prune -a -f || true
           df -h
 
-      # ---------- 1. 检出自己的仓库（带完整历史，便于和上游比较/合并） ----------
-      - name: Checkout own repo (full history)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+      # ---------- 1. 浅克隆上游 HEAD，仅用于"是否有更新"判断 ----------
+      - name: Shallow fetch upstream HEAD (for update check)
+        id: probe
+        run: |
+          git clone --depth 1 --branch "$UPSTREAM_BRANCH" "$UPSTREAM_REPO" /tmp/probe
+          UP_SHA=$(git -C /tmp/probe rev-parse HEAD)
+          echo "upstream_sha=$UP_SHA"         >> "$GITHUB_OUTPUT"
+          echo "upstream_short=${UP_SHA:0:8}" >> "$GITHUB_OUTPUT"
 
-      # ---------- 2. 检测上游是否有更新 ----------
-      - name: Detect upstream updates
+      # ---------- 2. 读取上次已编译的 sha ----------
+      - name: Restore last-built sha cache
+        id: cache-sha
+        uses: actions/cache@v4
+        with:
+          path: .last_sha
+          key: last-built-sha-${{ github.run_id }}
+          restore-keys: last-built-sha-
+
+      # ---------- 3. 决定是否编译 ----------
+      - name: Decide whether to build
         id: check
         run: |
-          git config --global user.name  "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          LOCAL_SHA=$(git rev-parse HEAD)
-          echo "local_sha=$LOCAL_SHA"
-
-          git remote add upstream "$UPSTREAM_REPO" || true
-          git fetch upstream "$UPSTREAM_BRANCH" --depth=200
-          UP_SHA=$(git rev-parse "upstream/$UPSTREAM_BRANCH")
-          echo "upstream_sha=$UP_SHA"
-
-          if git merge-base --is-ancestor "$UP_SHA" HEAD; then
-            HAS_UPDATE="false"
-          else
-            HAS_UPDATE="true"
-          fi
-          echo "has_update=$HAS_UPDATE"           >> "$GITHUB_OUTPUT"
-          echo "upstream_sha=$UP_SHA"             >> "$GITHUB_OUTPUT"
-          echo "upstream_short=${UP_SHA:0:8}"     >> "$GITHUB_OUTPUT"
+          UP="${{ steps.probe.outputs.upstream_sha }}"
+          LAST=""
+          [ -f .last_sha ] && LAST=$(cat .last_sha)
+          echo "upstream=$UP  last_built=$LAST"
 
           if [ "${{ github.event.inputs.force_build }}" = "true" ]; then
-            echo "强制编译已开启"
-            echo "has_update=true" >> "$GITHUB_OUTPUT"
+            echo "强制编译已开启"; HAS_UPDATE=true
+          elif [ "$UP" = "$LAST" ]; then
+            HAS_UPDATE=false
+          else
+            HAS_UPDATE=true
           fi
+          echo "has_update=$HAS_UPDATE" >> "$GITHUB_OUTPUT"
+          echo "$UP" > .last_sha
 
       - name: Skip if no update
         if: steps.check.outputs.has_update != 'true'
         run: echo "✅ 上游无新提交，本次不编译。"
 
-      # ---------- 3. 合并上游到当前分支 ----------
-      - name: Merge upstream into current branch
+      # ---------- 4. 保存"已编译 sha"指针 ----------
+      - name: Save last-built sha cache
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: .last_sha
+          key: last-built-sha-${{ github.run_id }}
+
+      # ---------- 5. 克隆完整源码到 openwrt/ ----------
+      - name: Clone full upstream source
         if: steps.check.outputs.has_update == 'true'
         run: |
-          # merge 保留你在 files/ 等处的本地定制；冲突时以本地为准兜底
-          git merge "upstream/$UPSTREAM_BRANCH" --no-edit -X theirs || {
-            echo "⚠️ 合并冲突，回退以本地为准继续";
-            git checkout --ours . && git add -A && git commit --no-edit || true;
-          }
-          echo "MERGED_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          git clone --branch "$UPSTREAM_BRANCH" "$UPSTREAM_REPO" openwrt
+          cd openwrt && echo "SRC_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
-      # ---------- 4. 安装编译依赖 ----------
+      # ---------- 6. 安装编译依赖 ----------
       - name: Install build dependencies
         if: steps.check.outputs.has_update == 'true'
         run: |
@@ -117,65 +122,97 @@ jobs:
           sudo -E apt-get -qq autoremove --purge
           sudo -E apt-get -qq clean
 
-      # ---------- 5. 缓存 dl / 编译中间产物（二次起大幅提速） ----------
+      # ---------- 7. 缓存 dl / 编译中间产物 ----------
       - name: Cache downloads & build dir
         if: steps.check.outputs.has_update == 'true'
         uses: actions/cache@v4
         with:
           path: |
-            dl
-            build_dir
-          key: ow-mt798x-${{ steps.check.outputs.upstream_short }}
+            openwrt/dl
+            openwrt/build_dir
+          key: ow-mt798x-${{ steps.probe.outputs.upstream_short }}
           restore-keys: |
             ow-mt798x-
 
-      # ---------- 6. 更新 feeds ----------
+      # ---------- 8. 更新 feeds ----------
       - name: Update & install feeds
         if: steps.check.outputs.has_update == 'true'
+        working-directory: openwrt
         run: |
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      # ---------- 7. 生成 .config（直接用你的 defconfig，不手动注入 target 行） ----------
-      - name: Generate .config from defconfig
+      # ---------- 9. 折中版 .config：237 调优 + 只保留 xdr6088 ----------
+      - name: Generate .config (237 tweaks + xdr6088 only)
         if: steps.check.outputs.has_update == 'true'
+        working-directory: openwrt
         run: |
           rm -f .config
-          if [ ! -f "$DEFCONFIG_FILE" ]; then
-            echo "❌ 找不到 $DEFCONFIG_FILE"; exit 1
-          fi
-          cp "$DEFCONFIG_FILE" .config
+          SRC="$DEFCONFIG_FILE"
+          [ -f "$SRC" ] || { echo "❌ 上游仓库里找不到 $SRC"; exit 1; }
+          cp "$SRC" .config
+
+          # 1) 关掉多机型 / 每设备独立 rootfs
+          sed -i 's/^CONFIG_TARGET_MULTI_PROFILE=y/# CONFIG_TARGET_MULTI_PROFILE is not set/' .config
+          sed -i 's/^CONFIG_TARGET_PER_DEVICE_ROOTFS=y/# CONFIG_TARGET_PER_DEVICE_ROOTFS is not set/' .config
+
+          # 2) 通用砍机型：删掉所有"设备勾选行/设备包行"中【不含目标设备名】的行
+          #    保留含 ${CFG_DEVICE} 的行（设备行 + 它的 PACKAGES 行）
+          sed -i -E "/^CONFIG_TARGET_DEVICE_/ { /${CFG_DEVICE}/!d; }" .config
+
+          # 3) 兜底确保目标设备勾选行存在
+          grep -q "CONFIG_TARGET_DEVICE_${CFG_TARGET}_${CFG_SUBTARGET}_DEVICE_${CFG_DEVICE}=y" .config \
+
+            || echo "CONFIG_TARGET_DEVICE_${CFG_TARGET}_${CFG_SUBTARGET}_DEVICE_${CFG_DEVICE}=y" >> .config
+
+          # 4) 展开默认配置
           make defconfig
 
-      # ---------- 8. 下载源码包 ----------
+          echo "================ 校验：当前选中的设备（应只有 xdr6088） ================"
+          grep -E "CONFIG_TARGET_.*_DEVICE_" .config | grep -v PACKAGES || true
+          echo "================ 校验：MULTI_PROFILE（应为 not set 或不存在） ================"
+          grep "CONFIG_TARGET_MULTI_PROFILE" .config || echo "（无 MULTI_PROFILE，确认单机型）"
+
+      # ---------- 10. 下载源码包 ----------
       - name: Download sources
         if: steps.check.outputs.has_update == 'true'
+        working-directory: openwrt
         run: make download -j8 V=s || make download -j1 V=s
 
-      # ---------- 9. 编译 ----------
+      # ---------- 11. 编译 ----------
       - name: Build firmware
         if: steps.check.outputs.has_update == 'true'
+        working-directory: openwrt
         run: |
           make toolchain/install -j${JOBS} V=s
           make -j${JOBS} V=s || make -j1 V=s
 
-      # ---------- 10. 收集固件（递归 bin/targets，兼容 filogic / mt7986 两种目录名） ----------
-      - name: Collect firmware images
+      # ---------- 12. 收集固件（双保险：只留 xdr6088） ----------
+      - name: Collect firmware images (xdr6088 only)
         if: steps.check.outputs.has_update == 'true'
         id: fw
         run: |
           mkdir -p firmware
-          # 不写死 subtarget，递归找所有镜像
-          find bin/targets -type f \
+          # 先递归收集所有镜像
+          find openwrt/bin/targets -type f \
             \( -name "*.bin" -o -name "*.img" -o -name "*.ubi" -o -name "*.itb" -o -name "*.trx" \) \
             -exec cp -v {} firmware/ \;
-          echo "---- 实际产物目录结构 ----"
-          find bin/targets -maxdepth 3 -type d
-          ls -lh firmware/ || true
-          echo "count=$(ls -1 firmware/ 2>/dev/null | wc -l)" >> "$GITHUB_OUTPUT"
-          (cd firmware && sha256sum * > SHA256SUMS) 2>/dev/null || true
+          # 再只保留 xdr6088 相关，删掉其它机型残留
+          cd firmware
+          for f in *; do
+            case "$f" in
+              *"${CFG_DEVICE}"*|*xdr6088*) ;;
+              *) rm -f "$f" ;;
+            esac
+          done
+          echo "---- openwrt/bin/targets 目录结构 ----"
+          find openwrt/bin/targets -maxdepth 3 -type d || true
+          echo "---- firmware/ 最终内容 ----"
+          ls -lh
+          echo "count=$(ls -1 2>/dev/null | grep -c .)" >> "$GITHUB_OUTPUT"
+          sha256sum * > SHA256SUMS 2>/dev/null || true
 
-      # ---------- 11. 上传 Actions 产物 ----------
+      # ---------- 13. 上传 Actions 产物 ----------
       - name: Upload artifact
         if: steps.check.outputs.has_update == 'true' && steps.fw.outputs.count != '0'
         uses: actions/upload-artifact@v4
@@ -184,25 +221,18 @@ jobs:
           path: firmware/
           retention-days: 30
 
-      # ---------- 12. 发 Release ----------
+      # ---------- 14. 发 Release ----------
       - name: Create GitHub Release
         if: steps.check.outputs.has_update == 'true' && steps.fw.outputs.count != '0'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ env.BUILD_DATE }}
-          name: "Firmware ${{ env.MAIN_DEVICE }} (+multi) @ ${{ env.BUILD_DATE }}"
+          name: "Firmware ${{ env.MAIN_DEVICE }} @ ${{ env.BUILD_DATE }}"
           body: |
-            自动检测 237 上游更新并编译。
-            - 上游 commit: `${{ steps.check.outputs.upstream_sha }}`
-            - 主机型: `${{ env.MAIN_DEVICE }}`（同时含 defconfig 内其它机型）
-            - defconfig: `${{ env.DEFCONFIG_FILE }}`
+            自动检测 237 上游更新并编译（237 调优 + 单机型）。
+            - 上游 commit: `${{ steps.probe.outputs.upstream_sha }}`
+            - 机型: `${{ env.CFG_DEVICE }}`
+            - 基础 defconfig: `${{ env.DEFCONFIG_FILE }}`
             - 构建时间: ${{ env.BUILD_DATE }}
           files: firmware/*
           prerelease: false
-
-      # ---------- 13. 把同步后的源码 push 回自己仓库 ----------
-      - name: Push synced source back to own repo
-        if: steps.check.outputs.has_update == 'true' && env.PUSH_BACK == 'true'
-        run: |
-          git push origin HEAD:${{ github.ref_name }} || \
-            echo "⚠️ 推送源码失败（不影响固件产物）"
