@@ -1,6 +1,6 @@
 name: 'Auto Update & Build Firmware'
 
-on:
+#on:
   schedule:
     - cron: '0 4,10,16,22 * * *'
   push:
