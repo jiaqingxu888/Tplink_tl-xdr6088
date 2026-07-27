@@ -41,8 +41,8 @@ jobs:
 
       - name: Set timezone and build date
         run: |
-          sudo timedatectl set-timezone "$TZ"
-          echo "BUILD_DATE=$(date +%Y%m%d-%H%M)" >> "$GITHUB_ENV"
+          sudo timedatectl set-timezone " $ TZ"
+          echo "BUILD_DATE= $ (date +%Y%m%d-%H%M)" >> " $ GITHUB_ENV"
 
       - name: Free disk space
         run: |
@@ -55,50 +55,50 @@ jobs:
       - name: Probe upstream and compute fingerprint and check release
         id: decide
         env:
-          FORCE: '${{ github.event.inputs.force_build }}'
-          GH_TOKEN: '${{ github.token }}'
+          FORCE: ' $ {{ github.event.inputs.force_build }}'
+          GH_TOKEN: ' $ {{ github.token }}'
         run: |
           set -e
-          UP_SHA=$(git ls-remote "$UPSTREAM_REPO" "refs/heads/${UPSTREAM_BRANCH}" | awk '{print $1}')
-          if [ -z "$UP_SHA" ]; then
+          UP_SHA= $ (git ls-remote " $ UPSTREAM_REPO" "refs/heads/ $ {UPSTREAM_BRANCH}" | awk '{print $1}')
+          if [ -z " $ UP_SHA" ]; then
             echo "FATAL cannot resolve upstream HEAD"
             exit 1
           fi
-          FP=$( ( echo "$UP_SHA"; cat "$DEFCFG_FILE"; echo "$CFG_TARGET|$CFG_SUBTARGET|$DEVICE_NAME|$DEFAULT_IP|$UPSTREAM_BRANCH" ) | sha256sum | cut -c1-12 )
-          HTTP=$(curl -sS -o /tmp/rel.json -w "%{http_code}" -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest" || true)
+          FP= $ ( ( echo " $ UP_SHA"; cat " $ DEFCFG_FILE"; echo " $ CFG_TARGET| $ CFG_SUBTARGET| $ DEVICE_NAME| $ DEFAULT_IP| $ UPSTREAM_BRANCH" ) | sha256sum | cut -c1-12 )
+          HTTP= $ (curl -sS -o /tmp/rel.json -w "%{http_code}" -H "Authorization: Bearer  $ GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/ $ {GITHUB_REPOSITORY}/releases/latest" || true)
           LAST_FP=""
           TAG=""
-          if [ "$HTTP" = "200" ]; then
-            TAG=$(jq -r '.tag_name // empty' /tmp/rel.json)
-            LAST_FP=$(echo "$TAG" | grep -oE '[0-9a-f]{12}' | head -1 || true)
+          if [ " $ HTTP" = "200" ]; then
+            TAG= $ (jq -r '.tag_name // empty' /tmp/rel.json)
+            LAST_FP= $ (echo " $ TAG" | grep -oE '[0-9a-f]{12}' | head -1 || true)
           fi
           REASON=""
-          if [ "$FORCE" = "true" ]; then
+          if [ " $ FORCE" = "true" ]; then
             SB=true; REASON="force_build is true"
-          elif [ -z "$LAST_FP" ]; then
+          elif [ -z " $ LAST_FP" ]; then
             SB=true; REASON="no matching release found"
-          elif [ "$LAST_FP" != "$FP" ]; then
+          elif [ " $ LAST_FP" != " $ FP" ]; then
             SB=true; REASON="fingerprint changed"
           else
             SB=false; REASON="release already has matching firmware"
           fi
           echo "================ DECIDE ================"
-          echo "upstream HEAD  = $UP_SHA"
-          echo "current FP     = $FP"
-          echo "latest release = ${TAG:-none}"
-          echo "release FP     = ${LAST_FP:-none}"
-          echo "SHOULD_BUILD   = $SB  ($REASON)"
+          echo "upstream HEAD  =  $ UP_SHA"
+          echo "current FP     =  $ FP"
+          echo "latest release =  $ {TAG:-none}"
+          echo "release FP     =  $ {LAST_FP:-none}"
+          echo "SHOULD_BUILD   =  $ SB  ( $ REASON)"
           echo "========================================"
-          echo "SHOULD_BUILD=$SB" >> "$GITHUB_ENV"
-          echo "FP=$FP" >> "$GITHUB_ENV"
-          echo "UP_SHA=$UP_SHA" >> "$GITHUB_ENV"
+          echo "SHOULD_BUILD= $ SB" >> " $ GITHUB_ENV"
+          echo "FP= $ FP" >> " $ GITHUB_ENV"
+          echo "UP_SHA= $ UP_SHA" >> " $ GITHUB_ENV"
 
       - name: Clone upstream source
         if: "env.SHOULD_BUILD == 'true'"
         run: |
-          git clone --depth 1 -b "$UPSTREAM_BRANCH" "$UPSTREAM_REPO" openwrt
+          git clone --depth 1 -b " $ UPSTREAM_BRANCH" " $ UPSTREAM_REPO" openwrt
           cd openwrt
-          echo "cloned HEAD = $(git rev-parse HEAD) expect $UP_SHA"
+          echo "cloned HEAD =  $ (git rev-parse HEAD) expect  $ UP_SHA"
 
       - name: Install build dependencies
         if: "env.SHOULD_BUILD == 'true'"
@@ -117,10 +117,10 @@ jobs:
         if: "env.SHOULD_BUILD == 'true'"
         working-directory: openwrt
         run: |
-          if [ ! -f "../$DEFCFG_FILE" ]; then
-            echo "FATAL defconfig not found in your repo: $DEFCFG_FILE"; exit 1
+          if [ ! -f "../ $ DEFCFG_FILE" ]; then
+            echo "FATAL defconfig not found in your repo:  $ DEFCFG_FILE"; exit 1
           fi
-          cp "../$DEFCFG_FILE" .config
+          cp "../ $ DEFCFG_FILE" .config
           make defconfig
           echo "================ X-RAY: target/device lines in .config AFTER make defconfig ================"
           grep -E '^#? ?CONFIG_TARGET_' .config | grep -E 'mediatek|filogic|DEVICE_|HAS_SUBTARGETS|MULTI_PROFILE|PER_DEVICE' || echo "(no target lines matched)"
@@ -136,9 +136,9 @@ jobs:
             echo "HINT (NOT CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_... and you also need CONFIG_TARGET_mediatek_filogic=y)"
             exit 1
           fi
-          OTHER=$(grep -E 'CONFIG_TARGET_.*_DEVICE_.*=y' .config | grep -v 'tplink_tl-xdr6088' || true)
-          if [ -n "$OTHER" ]; then
-            echo "WARN extra devices still enabled (filtered at collect step):"; echo "$OTHER"
+          OTHER= $ (grep -E 'CONFIG_TARGET_.*_DEVICE_.*=y' .config | grep -v 'tplink_tl-xdr6088' || true)
+          if [ -n " $ OTHER" ]; then
+            echo "WARN extra devices still enabled (filtered at collect step):"; echo " $ OTHER"
           fi
 
       - name: Download sources
@@ -149,58 +149,79 @@ jobs:
       - name: Build firmware
         if: "env.SHOULD_BUILD == 'true'"
         working-directory: openwrt
-        run: 'make -j$(nproc) V=s'
+        run: 'make -j $ (nproc) V=s'
 
       - name: Collect firmware and fail if empty
         if: "env.SHOULD_BUILD == 'true'"
         working-directory: openwrt
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/release"
-          find bin/targets -type f \( -name '*xdr6088*-sysupgrade.bin' -o -name '*xdr6088*-factory.bin' \) -exec cp -v {} "$GITHUB_WORKSPACE/release/" \;
+          mkdir -p " $ GITHUB_WORKSPACE/release"
+          find bin/targets -type f   $  -name '*xdr6088*-sysupgrade.bin' -o -name '*xdr6088*-factory.bin'  $   -exec cp -v {} " $ GITHUB_WORKSPACE/release/" \;
           echo "==== collected files ===="
-          ls -lh "$GITHUB_WORKSPACE/release/" || true
-          N=$(find "$GITHUB_WORKSPACE/release/" -type f \( -name '*-sysupgrade.bin' -o -name '*-factory.bin' \) | wc -l)
-          echo "firmware count = $N"
-          if [ "$N" -lt 1 ]; then echo "FATAL no xdr6088 firmware produced"; exit 1; fi
+          ls -lh " $ GITHUB_WORKSPACE/release/" || true
+          N= $ (find " $ GITHUB_WORKSPACE/release/" -type f   $  -name '*-sysupgrade.bin' -o -name '*-factory.bin'  $   | wc -l)
+          echo "firmware count =  $ N"
+          if [ " $ N" -lt 1 ]; then echo "FATAL no xdr6088 firmware produced"; exit 1; fi
 
       - name: Build release notes
         if: "env.SHOULD_BUILD == 'true'"
         working-directory: openwrt
         run: |
-          BIN=$(find "$GITHUB_WORKSPACE/release/" -name '*-sysupgrade.bin' | head -1)
-          MANIFEST=$(find bin/targets -name '*.manifest' | head -1)
-          PJSON=$(find bin/targets -name 'profiles.json' | head -1)
-          SIZE=$(ls -lh "$BIN" | awk '{print $5}')
-          VER=$(grep -oE '"version_number": *"[^"]*"' "$PJSON" | head -1 | cut -d'"' -f4)
-          VCODE=$(grep -oE '"version_code": *"[^"]*"' "$PJSON" | head -1 | cut -d'"' -f4)
-          UP_SHA_SHORT=${UP_SHA:0:10}
-          SHA256_SUMS=$(cd "$GITHUB_WORKSPACE/release" && sha256sum ./*.bin 2>/dev/null | sed 's# \./# #' || true)
+          BIN= $ (find " $ GITHUB_WORKSPACE/release/" -name '*-sysupgrade.bin' | head -1)
+          MANIFEST= $ (find bin/targets -name '*.manifest' | head -1)
+          PJSON= $ (find bin/targets -name 'profiles.json' | head -1)
+          SIZE= $ (ls -lh " $ BIN" | awk '{print $5}')
+          VER= $ (grep -oE '"version_number": *"[^"]*"' " $ PJSON" | head -1 | cut -d'"' -f4)
+          VCODE= $ (grep -oE '"version_code": *"[^"]*"' " $ PJSON" | head -1 | cut -d'"' -f4)
+          UP_SHA_SHORT= $ {UP_SHA:0:10}
+          RUN_URL=" $ {GITHUB_RUN_URL:-https://github.com/ $ {GITHUB_REPOSITORY}/actions/runs/ $ {GITHUB_RUN_ID}}"
+          SHA256_SUMS= $ (cd " $ GITHUB_WORKSPACE/release" && sha256sum ./*.bin 2>/dev/null | sed 's# \./# #' || true)
           PKG_COUNT=0
           PKGS_LIST="（未获取到包列表）"
-          if [ -n "$MANIFEST" ] && [ -f "$MANIFEST" ]; then
-            PKG_COUNT=$(awk -F' - ' 'NF>=1 && $1!="" {print $1}' "$MANIFEST" | sort -u | wc -l | tr -d ' ')
-            PKGS_LIST=$(awk -F' - ' 'NF>=1 && $1!="" {print $1}' "$MANIFEST" | sort -u | paste -sd ', ')
+          if [ -n " $ MANIFEST" ] && [ -f " $ MANIFEST" ]; then
+            PKG_COUNT= $ (awk -F' - ' 'NF>=1 && $1!="" {print $1}' " $ MANIFEST" | sort -u | wc -l | tr -d ' ')
+            PKGS_LIST= $ (awk -F' - ' 'NF>=1 && $1!="" {print $1}' " $ MANIFEST" | sort -u | paste -sd ', ')
+          fi
+          SEL_COUNT=0
+          SEL_PKGS=""
+          if [ -f " $ GITHUB_WORKSPACE/ $ DEFCFG_FILE" ]; then
+            SEL_COUNT= $ (grep -cE '^CONFIG_PACKAGE_.*=y' " $ GITHUB_WORKSPACE/ $ DEFCFG_FILE" || true)
+            SEL_PKGS= $ (grep -E '^CONFIG_PACKAGE_.*=y' " $ GITHUB_WORKSPACE/ $ DEFCFG_FILE" | sed -E 's/^CONFIG_PACKAGE_//; s/=y $ //' | sort -u | paste -sd ', ')
           fi
           OUT=/tmp/notes.md
           {
-            echo "# 📦 $DEVICE_NAME · $BUILD_DATE"
+            echo "# 📦  $ DEVICE_NAME ·  $ BUILD_DATE"
             echo ""
-            echo "- 🖥️ 设备：$DEVICE_NAME"
-            echo "- 🏷️ 版本：${VER:-unknown} (${VCODE:-unknown})"
-            echo "- 🔀 上游：$UP_SHA_SHORT  $UPSTREAM_REPO/commit/$UP_SHA"
-            echo "- 🧬 指纹：$FP"
-            echo "- 📐 大小：$SIZE"
-            echo "- 🌐 默认IP：$DEFAULT_IP"
-            echo "- 🕒 时间：$BUILD_DATE (Asia/Shanghai)"
+            echo "- 🖥️ 设备： $ DEVICE_NAME"
+            echo "- 🏷️ 版本： $ {VER:-unknown} ( $ {VCODE:-unknown})"
+            echo "- 🔀 上游仓库： $ UPSTREAM_REPO"
+            echo "- 🔖 本次 Commit：[ $ UP_SHA_SHORT]( $ UPSTREAM_REPO/commit/ $ UP_SHA)"
+            echo "- 🧬 指纹： $ FP"
+            echo "- 📐 大小： $ SIZE"
+            echo "- 🌐 默认IP： $ DEFAULT_IP"
+            echo "- 🕒 时间： $ BUILD_DATE (Asia/Shanghai)"
             echo "- ⚡ 特性：内核 BPF / XDP 已启用（dae 就绪）"
             echo ""
             echo "## ✅ 校验和 SHA256"
             echo '```'
-            echo " $ SHA256_SUMS"
+            echo "$SHA256_SUMS"
             echo '```'
             echo ""
-            echo "## 📦 内置软件包（$PKG_COUNT 个）"
-            echo "$PKGS_LIST"
+            echo "## ⭐ 配置启用的软件包（ $ SEL_COUNT 个）"
+            if [ " $ {#SEL_PKGS}" -gt 800 ]; then
+              echo " $ (echo " $ SEL_PKGS" | cut -c1-800) ……（共  $ SEL_COUNT 个，完整列表见下方折叠）"
+            elif [ -n " $ SEL_PKGS" ]; then
+              echo " $ SEL_PKGS"
+            else
+              echo "（defconfig 未显式指定额外包，全部内置包见下方折叠）"
+            fi
+            echo ""
+            echo "<details>"
+            echo "<summary>📦 查看全部内置包（含依赖，共  $ PKG_COUNT 个，点击展开）</summary>"
+            echo ""
+            echo " $ PKGS_LIST"
+            echo ""
+            echo "</details>"
             echo ""
             echo "## 🔄 升级提示"
             echo '1. Web：系统 → 备份/升级 → 上传 sysupgrade.bin'
@@ -208,17 +229,17 @@ jobs:
             echo '3. 升级前备份；跨大版本建议不保留配置'
             echo ""
             echo "---"
-            echo "🤖 GitHub Actions 自动构建 · $GITHUB_RUN_URL"
-          } > "$OUT"
+            echo "🤖 自动构建 · [查看本次构建日志]( $ RUN_URL)"
+          } > " $ OUT"
           echo "---- notes preview ----"
-          cat "$OUT"
+          cat " $ OUT"
 
       - name: Create GitHub Release
         if: "env.SHOULD_BUILD == 'true'"
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: 'build-${{ env.FP }}-${{ env.DEVICE_NAME }}'
-          name: '${{ env.DEVICE_NAME }} @ ${{ env.BUILD_DATE }} fp ${{ env.FP }}'
+          tag_name: 'build- $ {{ env.FP }}- $ {{ env.DEVICE_NAME }}'
+          name: ' $ {{ env.DEVICE_NAME }} @  $ {{ env.BUILD_DATE }} fp  $ {{ env.FP }}'
           body_path: /tmp/notes.md
           files: |
             release/*-sysupgrade.bin
