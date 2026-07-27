@@ -163,7 +163,7 @@ jobs:
           echo "firmware count = $N"
           if [ "$N" -lt 1 ]; then echo "FATAL no xdr6088 firmware produced"; exit 1; fi
 
-      - name: Build rich release notes
+      - name: Build release notes
         if: "env.SHOULD_BUILD == 'true'"
         working-directory: openwrt
         run: |
@@ -173,54 +173,43 @@ jobs:
           SIZE=$(ls -lh "$BIN" | awk '{print $5}')
           VER=$(grep -oE '"version_number": *"[^"]*"' "$PJSON" | head -1 | cut -d'"' -f4)
           VCODE=$(grep -oE '"version_code": *"[^"]*"' "$PJSON" | head -1 | cut -d'"' -f4)
-          PKGS=$(awk -F' - ' '{print $1}' "$MANIFEST" | sort | paste -sd ', ')
           UP_SHA_SHORT=${UP_SHA:0:10}
           SHA256_SUMS=$(cd "$GITHUB_WORKSPACE/release" && sha256sum ./*.bin 2>/dev/null | sed 's# \./# #' || true)
           PKG_COUNT=0
-          PKGS_LIST="_(未获取到包列表)_"
+          PKGS_LIST="（未获取到包列表）"
           if [ -n "$MANIFEST" ] && [ -f "$MANIFEST" ]; then
             PKG_COUNT=$(awk -F' - ' 'NF>=1 && $1!="" {print $1}' "$MANIFEST" | sort -u | wc -l | tr -d ' ')
-            PKGS_LIST=$(awk -F' - ' 'NF>=1 && $1!="" {print $1}' "$MANIFEST" | sort -u | sed 's/.*/`&`/' | paste -sd ' ')
+            PKGS_LIST=$(awk -F' - ' 'NF>=1 && $1!="" {print $1}' "$MANIFEST" | sort -u | paste -sd ', ')
           fi
           OUT=/tmp/notes.md
-          cat <<NOTES_EOF > "$OUT"
-## 📦 固件信息
-
-| 属性 | 值 |
-| --- | --- |
-| 🖥️ 设备型号 | `$DEVICE_NAME` |
-| 🏷️ 固件版本 | ${VER:-unknown} (${VCODE:-unknown}) |
-| 🔀 上游 Commit | [`$UP_SHA_SHORT`]($UPSTREAM_REPO/commit/$UP_SHA) |
-| 🧬 编译指纹 | `$FP` |
-| 📐 固件大小 | $SIZE |
-| 🌐 默认 IP | `$DEFAULT_IP` |
-| 🕒 编译时间 | $BUILD_DATE (Asia/Shanghai) |
-| ⚡ 特性 | 内核 BPF / XDP 已启用（dae 就绪） |
-
-## 🔄 升级指南
-
-1. **Web 升级（LuCI）**：`系统` → `备份/升级` → 上传 `sysupgrade.bin`，按需勾选"保留配置"。
-2. **命令行升级**：`sysupgrade -n /tmp/<固件名>.bin`（`-n` 不保留配置；首次刷入或跨大版本强烈建议加）。
-3. ⚠️ 升级前务必备份配置；跨大版本建议**不保留配置**以防兼容性问题。
-
-## ✅ 校验和 (SHA256)
-
-```text
-$SHA256_SUMS
-
-```
-
-<details>
-<summary>📦 内置软件包（点击展开，共 $PKG_COUNT 个）</summary>
-
-$PKGS_LIST
-
-</details>
-
----
-
-> 🤖 由 GitHub Actions 自动构建 · [查看本次构建日志]($GITHUB_RUN_URL)
-NOTES_EOF
+          {
+            echo "# 📦 $DEVICE_NAME · $BUILD_DATE"
+            echo ""
+            echo "- 🖥️ 设备：$DEVICE_NAME"
+            echo "- 🏷️ 版本：${VER:-unknown} (${VCODE:-unknown})"
+            echo "- 🔀 上游：$UP_SHA_SHORT  $UPSTREAM_REPO/commit/$UP_SHA"
+            echo "- 🧬 指纹：$FP"
+            echo "- 📐 大小：$SIZE"
+            echo "- 🌐 默认IP：$DEFAULT_IP"
+            echo "- 🕒 时间：$BUILD_DATE (Asia/Shanghai)"
+            echo "- ⚡ 特性：内核 BPF / XDP 已启用（dae 就绪）"
+            echo ""
+            echo "## ✅ 校验和 SHA256"
+            echo '```'
+            echo " $ SHA256_SUMS"
+            echo '```'
+            echo ""
+            echo "## 📦 内置软件包（$PKG_COUNT 个）"
+            echo "$PKGS_LIST"
+            echo ""
+            echo "## 🔄 升级提示"
+            echo '1. Web：系统 → 备份/升级 → 上传 sysupgrade.bin'
+            echo '2. 命令行：sysupgrade -n /tmp/固件.bin （-n 不保留配置）'
+            echo '3. 升级前备份；跨大版本建议不保留配置'
+            echo ""
+            echo "---"
+            echo "🤖 GitHub Actions 自动构建 · $GITHUB_RUN_URL"
+          } > "$OUT"
           echo "---- notes preview ----"
           cat "$OUT"
 
