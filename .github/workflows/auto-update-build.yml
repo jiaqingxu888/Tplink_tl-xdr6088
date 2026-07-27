@@ -146,24 +146,45 @@ jobs: build: runs-on: ubuntu-22.04 timeout-minutes: 360 steps: - name: Checkout 
       VCODE=$(grep -oE '"version_code": *"[^"]*"' "$PJSON" | head -1 | cut -d'"' -f4)
       PKGS=$(awk -F' - ' '{print $1}' "$MANIFEST" | sort | paste -sd ', ')
       OUT=/tmp/notes.md
-      echo "## 固件信息" > "$OUT"
-      echo "- 型号 $DEVICE_NAME" >> "$OUT"
-      echo "- 版本 ${VER:-unknown} (${VCODE:-unknown})" >> "$OUT"
-      echo "- 上游 commit ${UP_SHA:0:10}" >> "$OUT"
-      echo "- 编译指纹 $FP" >> "$OUT"
-      echo "- 固件大小 $SIZE" >> "$OUT"
-      echo "- 默认管理 IP $DEFAULT_IP" >> "$OUT"
-      echo "- 编译时间 $BUILD_DATE (Asia/Shanghai)" >> "$OUT"
-      echo "- 内核 BPF/XDP 已启用 (dae 就绪)" >> "$OUT"
-      echo "" >> "$OUT"
-      echo "## 内置软件包" >> "$OUT"
-      echo "$PKGS" | tr ',' '\n' | sed 's/^/- /' >> "$OUT"
-      echo "" >> "$OUT"
-      echo "## 怎么更新" >> "$OUT"
-      echo "1. LuCI 系统 - 备份/升级 - 上传 sysupgrade.bin，按需勾选保留配置。" >> "$OUT"
-      echo "2. 命令行 sysupgrade -n /tmp/固件名 （-n 不保留配置，首次或跨大版本建议加）。" >> "$OUT"
-      echo "3. 升级前先备份配置；跨大版本建议不保留配置。" >> "$OUT"
-      echo "---- notes preview ----"; cat "$OUT"
+                cat <<EOF > "$OUT"
+          ## 📦 固件信息 (Firmware Info)
+
+          | 属性 | 值 |
+          | :--- | :--- |
+          | **设备型号** | $DEVICE_NAME |
+          | **固件版本** | ${VER} (${VCODE}) |
+          | **上游 Commit** | [${UP_SHA:0:10}]($UPSTREAM_REPO/commit/$UP_SHA) |
+          | **编译指纹** | \`$FP\` |
+          | **固件大小** | $SIZE |
+          | **默认 IP** | \`$DEFAULT_IP\` |
+          | **编译时间** | $BUILD_DATE (Asia/Shanghai) |
+          | **特性** | 内核 BPF/XDP 已启用 (dae 就绪) |
+
+          ## 📝 更新说明 (Update Guide)
+
+          1. **Web 升级 (LuCI)**: 系统 -> 备份/升级 -> 上传 \`sysupgrade.bin\`，按需勾选“保留配置”。
+          2. **命令行升级**: \`sysupgrade -n /tmp/固件名.bin\`（\`-n\` 表示不保留配置，首次刷入或跨大版本升级强烈建议添加）。
+          3. ⚠️ **注意**: 升级前请务必备份重要配置；跨大版本升级建议**不保留配置**以防兼容性问题。
+
+          ## 📊 校验和 (SHA256 Checksums)
+
+          \`\`\`text
+          $SHA256_SUMS
+          \`\`\`
+
+          <details>
+          <summary>📦 内置软件包列表 (Installed Packages)</summary>
+
+          $PKGS_LIST
+          </details>
+
+          ---
+          > 🤖 本固件由 GitHub Actions 自动编译生成 | [查看构建日志]($GITHUB_RUN_URL)
+          EOF
+          
+          echo "---- notes preview ----"
+          cat "$OUT"
+
 
   - name: Create GitHub Release
     if: "env.SHOULD_BUILD == 'true'"
