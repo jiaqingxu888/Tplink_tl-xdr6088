@@ -1,0 +1,106 @@
+name: 'Auto Update & Build Firmware'
+
+on:
+  schedule:
+    - cron: '0 4,10,16,22 * * *'
+  push:
+    paths:
+      - 'defconfig/'
+      - '.github/workflows/'
+      - 'scripts/'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'force build even if release already has matching firmware'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-update-build
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPO: https://github.com/padavanonly/immortalwrt-mt798x-6.6.git
+  UPSTREAM_BRANCH: openwrt-24.10-6.6
+  DEFCFG_FILE: defconfig/mt7986-ax6000_dae.config
+  CFG_TARGET: mediatek
+  CFG_SUBTARGET: filogic
+  DEVICE_NAME: tplink_tl-xdr6088
+  DEFAULT_IP: '192.168.1.1'
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Make scripts executable
+        run: chmod +x scripts/*.sh
+
+      - name: Set timezone and build date
+        run: bash scripts/01-env.sh
+
+      - name: Free disk space
+        run: bash scripts/02-free-disk.sh
+
+      - name: Decide whether to build
+        run: bash scripts/03-decide.sh
+
+      - name: Clone upstream source
+        if: env.SHOULD_BUILD == 'true'
+        run: bash scripts/04-clone.sh
+
+      - name: Install build dependencies
+        if: env.SHOULD_BUILD == 'true'
+        run: bash scripts/05-deps.sh
+
+      - name: Update and install feeds
+        if: env.SHOULD_BUILD == 'true'
+        working-directory: openwrt
+        run: bash ../scripts/06-feeds.sh
+
+      - name: Apply defconfig and lock single device
+        if: env.SHOULD_BUILD == 'true'
+        working-directory: openwrt
+        run: bash ../scripts/07-defconfig.sh
+
+      - name: Download sources
+        if: env.SHOULD_BUILD == 'true'
+        working-directory: openwrt
+        run: bash ../scripts/08-download.sh
+
+      - name: Build firmware
+        if: env.SHOULD_BUILD == 'true'
+        working-directory: openwrt
+        run: bash ../scripts/09-build.sh
+
+      - name: Collect firmware
+        if: env.SHOULD_BUILD == 'true'
+        working-directory: openwrt
+        run: bash ../scripts/10-collect.sh
+
+      - name: Build release notes
+        if: env.SHOULD_BUILD == 'true'
+        working-directory: openwrt
+        run: bash ../scripts/11-notes.sh
+
+      - name: Create GitHub Release
+        if: env.SHOULD_BUILD == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ env.FP }}-${{ env.DEVICE_NAME }}
+          name: ${{ env.DEVICE_NAME }} @ ${{ env.BUILD_DATE }} fp ${{ env.FP }}
+          body_path: /tmp/notes.md
+          files: |
+            release/*-sysupgrade.bin
+            release/*-factory.bin
+
+      - name: Skip notice
+        if: env.SHOULD_BUILD != 'true'
+        run: echo "No build needed - release already up-to-date."
