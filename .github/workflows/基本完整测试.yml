@@ -2,7 +2,7 @@ name: 'Auto Update & Build Firmware'
 
 on:
   schedule:
-      - cron: '0 22 * * 6'        # 每周一次；UTC 周六 22:00 = 北京 周日 06:00
+      - cron: '0 22 * * 6'
   push:
     paths:
       - 'defconfig/'
