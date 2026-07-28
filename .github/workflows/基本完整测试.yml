@@ -2,7 +2,7 @@ name: 'Auto Update & Build Firmware'
 
 on:
   schedule:
-      - cron: '0 22 * * 8'
+      - cron: '0 23 * * 7'
   push:
     paths:
       - 'defconfig/'
