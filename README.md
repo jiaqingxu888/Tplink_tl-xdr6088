@@ -1,6 +1,6 @@
 # Tplink_tl-xdr6088
 
-1:每6小时检测上游代码更新
+1:每个礼拜检测上游代码更新
 
 2:上游代码 为237大佬的：https://github.com/padavanonly/immortalwrt-mt798x-6.6
 
