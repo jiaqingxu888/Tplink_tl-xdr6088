@@ -40,6 +40,13 @@ jobs:
       - name: Checkout this repo
         uses: actions/checkout@v4
 
+      # ==========================================
+      # 【新增】生成唯一的时间戳 Tag，防止覆盖
+      # ==========================================
+      - name: Generate Unique Tag
+        id: tag_gen
+        run: echo "unique_tag=build-$(date +'%Y%m%d-%H%M')" >> $GITHUB_OUTPUT
+
       - name: Make scripts executable
         run: chmod +x scripts/*.sh
 
@@ -94,7 +101,13 @@ jobs:
         if: env.SHOULD_BUILD == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-${{ env.FP }}-${{ env.DEVICE_NAME }}
+          # ==========================================
+          # 【关键修改】这里引用上面生成的 unique_tag
+          # 这样每次 Tag 都是 build-20260815-1652 这种格式
+          # 绝不会重复，也就不会覆盖旧 Release 了
+          # ==========================================
+          tag_name: ${{ steps.tag_gen.outputs.unique_tag }}
+          
           name: ${{ env.DEVICE_NAME }} @ ${{ env.BUILD_DATE }} fp ${{ env.FP }}
           body_path: /tmp/notes.md
           files: |
