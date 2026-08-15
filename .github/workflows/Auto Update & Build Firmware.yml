@@ -29,7 +29,7 @@ env:
   CFG_TARGET: mediatek
   CFG_SUBTARGET: filogic
   DEVICE_NAME: tplink_tl-xdr6088
-  DEFAULT_IP: '192.168.1.1'
+  DEFAULT_IP: '192.168.6.1'
   TZ: Asia/Shanghai
 
 jobs:
